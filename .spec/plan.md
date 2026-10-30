@@ -7,6 +7,54 @@ Based on `.spec/handover.md`. This plan keeps the handover's phases but changes 
 3. It **builds the engine alongside Phases 1–2**, because the engine is the critical path.
 4. It fixes several **technical gaps** in the handover (section 2) that would otherwise surface in Phase 3 or 6.
 
+## Progress (2026-10-30)
+
+| Item | State |
+|------|-------|
+| Phase 0 — foundations, harness, sim disk | **Done.** `./build.ps1` builds and tests everything. |
+| Engine track — journal + block mover (`opm-core`) | **Done on the simulator.** Two-slot CRC journal, chunk ≤ shift rule (G3), per-chunk flush + read-back (G7), table-vs-journal reconciliation (G6), journal on a separate disk (G5). Crash campaigns cover left/right/overlapping/partial-chunk/4Kn moves, including crashes during recovery. No Win32 disk code yet. |
+| Engine on Windows (`opm-platform-win32`, `opm-engine`) | **Working on VHDX test disks.** Raw unbuffered write-through I/O, volume lock/dismount, layout edits via `IOCTL_DISK_SET_DRIVE_LAYOUT_EX`, file journal. New gap **G9** handled: the partition's table entry is removed for the whole move (a snapshot of the raw entry is journaled), so Windows can't mount a half-moved volume after a crash; the final table write puts the entry back at the target. Source SHA-256 is journaled and the target must match before the entry goes back. Recovery refuses to write if another partition has been created over the source or target meanwhile. Verified on GPT right/left-overlapping/boxed-in/4Kn/tight and MBR moves, plus process kills mid-move with recovery: files byte-identical, `Repair-Volume -Scan` clean, GPT volume GUID preserved. **Write guard:** only file-backed virtual disks can be opened for writing. |
+| Phase 1 — read-only discovery | **Done, pending Azure validation.** `opm list` / `opm show`, WPF disk map, refusal/warning classifier, read-only enforcement tests. Matches `Get-Partition`/`Get-Volume`/`Get-Disk` on all 7 harness layouts. Azure detection (SMBIOS asset tag + IMDS) and temp-disk heuristics are untested on a real Azure VM. |
+| Spike S2 (early evidence) | MBR volume GUIDs are built from disk signature + partition offset (e.g. `{6facef11-0000-0000-0000-100000000000}` = signature 0x6FACEF11, offset 0x100000). Confirms G1: an MBR move changes the volume GUID unless MountedDevices is rewritten. |
+| Spikes S1–S4 | **Waiting on test VMs.** |
+| Azure field test #1 (2026-10-30) | Real Azure VM: Windows Server **2016** (14393), Gen 1, MBR, ATA, Standard_B4ms, australiasoutheast. Self-contained .NET 10 runs on 2016. Azure detection, IMDS and temp-disk labelling (D:, with a page file) all correct; engine refused both real disks. Bugs found and fixed: MBR EBR chain link entries were shown as extra extended partitions; the self-test assumed a 16 MiB MSR (Server 2016 creates 128 MiB). |
+
+### G10 (resolved): resuming a move on Server 2016
+
+Azure field tests #3–#4 (Server 2016): a move killed part way could not be resumed. Recovery's
+raw writes succeed in free space but get ERROR_ACCESS_DENIED at the first write into the hidden
+partition's own range, although Windows shows no volume on it. The uninterrupted move works
+because the volume lock taken before hiding is held throughout. Windows 11 doesn't block these
+writes. Tried locking the partition device (`\Device\HarddiskN\PartitionM`) during recovery:
+it gets past the denial, but on Windows 11 recovery then produced data that failed the final
+digest check in 3 of 3 rounds (0 of 3 without the lock). The digest check caught it and the
+partition stayed hidden, but the lock is unusable. Removed.
+
+Fix (2026-10-30, journal format 2): instead of changing the partition's type to hide it, the
+mover **removes its table entry** for the duration of the move. The journal stores the raw
+`PARTITION_INFORMATION_EX` (type, GUID, attributes, GPT name, MBR active flag) and the final
+table write puts it back at the target; GPT entries leave the array, MBR primary slots are
+emptied in place. Raw writes into unpartitioned space were allowed on Server 2016 in every
+test, and nothing can mount a partition that isn't in the table. Recovery checks that no
+partition now overlaps the source or target before writing (`MoveError::RangeInUse`).
+Verified: simulator crash campaigns, all VHDX engine tests and the packaged self-test on
+Windows 11 (GPT volume GUID survives the remove and re-add). **Confirmed on Server 2016**
+(Azure field test #5): killed after 6 of 32 chunks, recovery resumed with the entry out of the
+table, files identical, scan clean, volume GUID kept. Still to do: the GUI/CLI must read the journal and mark the range, because during an interrupted move
+it shows as free space in Disk Management; README warning.
+
+### Field finding: the boxed-in C: on MBR with logical drives
+
+The test VM is the real-world case: C: (51.5 GB, 71% used) is followed by a primary (I:) and an
+**extended partition holding three logical drives** (E:, L:, K:), with 129 GB free at the end of
+the disk. Extending C: means moving I: *and the whole extended container* right. v1 refuses
+logical-drive moves, so the planner can't solve this yet. Proposed: move the extended container
+as one block. EBR link offsets are relative to the container start and each logical drive is
+relative to its own EBR, so a whole-container block copy keeps the internal chain valid, and
+only the primary table's extended entry changes. Every logical volume's absolute offset still
+changes, so the MBR `MountedDevices` fix-up (G1) is needed for each of them. Add to Phase 4 and
+test on the Gen 1 Hyper-V VM first.
+
 ---
 
 ## 1. Decisions to make now
