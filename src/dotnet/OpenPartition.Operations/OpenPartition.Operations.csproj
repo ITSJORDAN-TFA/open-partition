@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />
+    <ProjectReference Include="../OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+  </ItemGroup>
+
+</Project>

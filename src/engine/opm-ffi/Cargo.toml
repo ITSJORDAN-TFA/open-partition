@@ -1,0 +1,22 @@
+[package]
+name = "opm-ffi"
+description = "C ABI over the engine, loaded by the .NET service."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "opm_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+opm-core = { path = "../opm-core" }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

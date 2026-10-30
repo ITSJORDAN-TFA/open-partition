@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: Run Hyper-V integration tests on the self-hosted runner
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/engine
+
+      - name: Build and test
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-results
+          path: tests/harness/out/results.json
+          if-no-files-found: ignore
+
+  # Needs a self-hosted Windows runner with Hyper-V enabled, running elevated,
+  # labelled `hyperv`. Only runs on request until one is registered.
+  integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.integration
+    runs-on: [self-hosted, windows, hyperv]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test with integration
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release -Integration

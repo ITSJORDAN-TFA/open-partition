@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["opm-core", "opm-platform-sim", "opm-platform-win32", "opm-ffi"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+panic = "abort"

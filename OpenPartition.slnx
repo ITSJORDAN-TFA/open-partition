@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/dotnet/">
+    <Project Path="src/dotnet/OpenPartition.Cli/OpenPartition.Cli.csproj" />
+    <Project Path="src/dotnet/OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+    <Project Path="src/dotnet/OpenPartition.Gui/OpenPartition.Gui.csproj" />
+    <Project Path="src/dotnet/OpenPartition.Model/OpenPartition.Model.csproj" />
+    <Project Path="src/dotnet/OpenPartition.Operations/OpenPartition.Operations.csproj" />
+    <Project Path="src/dotnet/OpenPartition.Service/OpenPartition.Service.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+  <Folder Name="/tests/dotnet/">
+    <Project Path="tests/dotnet/OpenPartition.Tests/OpenPartition.Tests.csproj" />
+  </Folder>
+</Solution>

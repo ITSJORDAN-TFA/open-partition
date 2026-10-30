@@ -1,0 +1,19 @@
+[package]
+name = "opm-platform-win32"
+description = "Win32 implementation of the engine platform layer: raw disk I/O, volume lock and dismount, layout IOCTLs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+opm-core = { path = "../opm-core" }
+
+# Raw disk access needs FFI, so this crate (and opm-ffi) are the only ones allowed `unsafe`.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

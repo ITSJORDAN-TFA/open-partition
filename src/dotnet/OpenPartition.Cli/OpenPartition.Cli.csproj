@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>opm</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />
+    <ProjectReference Include="../OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+    <ProjectReference Include="../OpenPartition.Operations/OpenPartition.Operations.csproj" />
+  </ItemGroup>
+
+</Project>

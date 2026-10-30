@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />
+    <ProjectReference Include="../OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+    <ProjectReference Include="../OpenPartition.Operations/OpenPartition.Operations.csproj" />
+  </ItemGroup>
+</Project>

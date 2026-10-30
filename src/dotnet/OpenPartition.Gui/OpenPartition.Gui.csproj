@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />
+    <ProjectReference Include="../OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+    <ProjectReference Include="../OpenPartition.Operations/OpenPartition.Operations.csproj" />
+  </ItemGroup>
+
+</Project>
