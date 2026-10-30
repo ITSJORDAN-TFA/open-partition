@@ -488,3 +488,6 @@ $RECYCLE.BIN/
 # Harness artefacts
 /tests/harness/out/
 *.vhdx
+
+# Packages
+/artifacts/

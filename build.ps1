@@ -12,7 +12,9 @@
 param(
     [ValidateSet('Debug', 'Release')] [string] $Configuration = 'Debug',
     [switch] $SkipTests,
-    [switch] $Integration
+    [switch] $Integration,
+    # Folder for test VHDX disks (use a fast SSD); see tests/harness/Invoke-HarnessTests.ps1.
+    [string] $WorkDir
 )
 
 Set-StrictMode -Version Latest
@@ -42,6 +44,7 @@ if (-not $SkipTests) {
     Invoke-Step 'Harness: self-tests' {
         $harnessArgs = @{}
         if ($Integration) { $harnessArgs.Integration = $true }
+        if ($WorkDir) { $harnessArgs.WorkDir = $WorkDir }
         & (Join-Path $root 'tests/harness/Invoke-HarnessTests.ps1') @harnessArgs
     }
 }
