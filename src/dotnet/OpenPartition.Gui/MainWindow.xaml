@@ -1,12 +1,180 @@
-﻿<Window x:Class="OpenPartition.Gui.MainWindow"
+<Window x:Class="OpenPartition.Gui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:OpenPartition.Gui"
-        mc:Ignorable="d"
-        Title="MainWindow" Height="450" Width="800">
-    <Grid>
+        Title="{Binding Title}" Width="1280" Height="800" MinWidth="800" MinHeight="480"
+        FontFamily="Segoe UI" FontSize="13" Background="#FAFBFC">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="Visible" />
 
-    </Grid>
+        <DataTemplate x:Key="IssueTemplate" DataType="{x:Type local:IssueRow}">
+            <DockPanel Margin="0,2">
+                <TextBlock DockPanel.Dock="Left" Width="64" Text="{Binding Severity}" Foreground="{Binding Brush}" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="{Binding Brush}" />
+            </DockPanel>
+        </DataTemplate>
+
+        <Style x:Key="SegmentButton" TargetType="Button">
+            <Setter Property="Margin" Value="1,0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Outer" Background="{Binding Fill}" BorderBrush="#C5CAD3" BorderThickness="1" CornerRadius="3">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="*" />
+                                    <RowDefinition Height="6" />
+                                </Grid.RowDefinitions>
+                                <StackPanel Margin="6,4" VerticalAlignment="Center">
+                                    <TextBlock x:Name="TitleText" Text="{Binding Title}" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="SubText" Text="{Binding Subtitle}" FontSize="11" Foreground="#E6ECF5" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Text="&#xE72E;" FontFamily="Segoe MDL2 Assets" FontSize="11" Foreground="White"
+                                           HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,4,5,0"
+                                           ToolTip="Some operations are refused; select for details"
+                                           Visibility="{Binding HasRefusals, Converter={StaticResource Visible}}" />
+                                <ProgressBar x:Name="Usage" Grid.Row="1" Minimum="0" Maximum="1" Value="{Binding UsedFraction, Mode=OneWay, TargetNullValue=0}"
+                                             BorderThickness="0" Background="#33000000" Foreground="#CCFFFFFF" Margin="2,0,2,2" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <DataTrigger Binding="{Binding IsFree}" Value="True">
+                                <Setter TargetName="TitleText" Property="Foreground" Value="#4A5560" />
+                                <Setter TargetName="SubText" Property="Foreground" Value="#6B7580" />
+                                <Setter TargetName="Outer" Property="BorderBrush" Value="#AEB5BF" />
+                                <Setter TargetName="Usage" Property="Visibility" Value="Hidden" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                <Setter TargetName="Outer" Property="BorderBrush" Value="#F5B400" />
+                                <Setter TargetName="Outer" Property="BorderThickness" Value="3" />
+                            </DataTrigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Outer" Property="Opacity" Value="0.9" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <DockPanel>
+        <!-- Toolbar -->
+        <Border DockPanel.Dock="Top" Background="White" BorderBrush="#E1E4E8" BorderThickness="0,0,0,1" Padding="12,8">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="Refresh" Padding="14,4" Command="{Binding RefreshCommand}" />
+                <StackPanel>
+                    <TextBlock Text="{Binding Title}" FontSize="16" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding Status}" Foreground="#5A6470" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- Machine-wide warnings (Azure snapshot reminder, not elevated, ...) -->
+        <ItemsControl DockPanel.Dock="Top" ItemsSource="{Binding Banners}">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <Border Background="#FFF8E1" BorderBrush="#F0D58C" BorderThickness="0,0,0,1" Padding="12,6">
+                        <ContentPresenter Content="{Binding}" ContentTemplate="{StaticResource IssueTemplate}" />
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+
+        <!-- Footer disclaimer -->
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding Disclaimer}" Foreground="#6B7580" FontSize="11" Margin="12,6" TextWrapping="Wrap" />
+
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="380" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Disk map -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+                <ItemsControl ItemsSource="{Binding Disks}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type local:DiskViewModel}">
+                            <Border Background="White" BorderBrush="#E1E4E8" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Header}" FontWeight="SemiBold" FontSize="14" />
+                                    <TextBlock Text="{Binding SubHeader}" Foreground="#5A6470" Margin="0,2,0,8" />
+                                    <ItemsControl ItemsSource="{Binding Issues}" ItemTemplate="{StaticResource IssueTemplate}" Margin="0,0,0,6" />
+                                    <ItemsControl ItemsSource="{Binding Segments}" Height="62">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <local:ProportionalPanel MinChildWidth="64" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemContainerStyle>
+                                            <Style TargetType="ContentPresenter">
+                                                <Setter Property="local:ProportionalPanel.Weight" Value="{Binding Weight}" />
+                                            </Style>
+                                        </ItemsControl.ItemContainerStyle>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate DataType="{x:Type local:SegmentViewModel}">
+                                                <Button Style="{StaticResource SegmentButton}" Click="OnSegmentClick" ToolTip="{Binding Heading}" />
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <!-- Details -->
+            <Border Grid.Column="1" Background="White" BorderBrush="#E1E4E8" BorderThickness="1,0,0,0">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="14">
+                    <Grid>
+                        <TextBlock Text="Select a partition or free space to see its details and what can be done with it."
+                                   TextWrapping="Wrap" Foreground="#6B7580">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Selected}" Value="{x:Null}">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <StackPanel DataContext="{Binding Selected}">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding}" Value="{x:Null}">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="{Binding Heading}" FontSize="15" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,10" />
+                            <ItemsControl ItemsSource="{Binding Details}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate DataType="{x:Type local:DetailRow}">
+                                        <Grid Margin="0,2">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="110" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding Name}" Foreground="#5A6470" />
+                                            <TextBox Grid.Column="1" Text="{Binding Value, Mode=OneWay}" IsReadOnly="True" BorderThickness="0" Background="Transparent" TextWrapping="Wrap" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <TextBlock Text="Possible in later versions" FontWeight="SemiBold" Margin="0,14,0,2" />
+                            <TextBlock Text="{Binding Allowed}" TextWrapping="Wrap" />
+                            <TextBlock Text="Warnings and refusals" FontWeight="SemiBold" Margin="0,14,0,2" />
+                            <ItemsControl ItemsSource="{Binding Issues}" ItemTemplate="{StaticResource IssueTemplate}" />
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+    </DockPanel>
 </Window>
