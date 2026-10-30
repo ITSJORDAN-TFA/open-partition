@@ -4,14 +4,18 @@
 # Partitions are created in order. Offset (MiB) is optional; without it a partition follows
 # the previous one. Size 0 means "use the rest of the disk". FillPercent controls how much
 # deterministic test data is written to the volume.
+#
+# Kept small on purpose: every integration run builds, fills, moves and re-reads these, and
+# the shapes (overlap, alignment, sector size, table style) matter, not the size. GPT disks
+# also get a 16 MiB MSR from Initialize-Disk, so the first GPT partition starts at 16 MiB.
 @{
     'gpt-512n-single' = @{
         Description  = 'One data partition with free space after it.'
         Style        = 'GPT'
         SectorFormat = '512n'
-        DiskSizeMB   = 2048
+        DiskSizeMB   = 1024
         Partitions   = @(
-            @{ SizeMB = 1024; FileSystem = 'NTFS'; Label = 'DATA1'; FillPercent = 60 }
+            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'DATA1'; FillPercent = 60 }
         )
     }
 
@@ -19,21 +23,21 @@
         Description  = 'The case that started the project: the middle partition needs to grow, free space is at the end.'
         Style        = 'GPT'
         SectorFormat = '512e'
-        DiskSizeMB   = 4096
+        DiskSizeMB   = 2048
         Partitions   = @(
-            @{ SizeMB = 768;  FileSystem = 'NTFS'; Label = 'LEFT';   FillPercent = 50 }
-            @{ SizeMB = 768;  FileSystem = 'NTFS'; Label = 'TARGET'; FillPercent = 80 }
-            @{ SizeMB = 512;  FileSystem = 'NTFS'; Label = 'RIGHT';  FillPercent = 50 }
+            @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'LEFT';   FillPercent = 50 }
+            @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'TARGET'; FillPercent = 80 }
+            @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'RIGHT';  FillPercent = 50 }
         )
     }
 
     'gpt-512n-free-left' = @{
-        Description  = 'Free space before the partition, for left moves.'
+        Description  = 'Free space before the partition, for left moves that overlap their source.'
         Style        = 'GPT'
         SectorFormat = '512n'
-        DiskSizeMB   = 2048
+        DiskSizeMB   = 1024
         Partitions   = @(
-            @{ OffsetMB = 513; SizeMB = 1024; FileSystem = 'NTFS'; Label = 'SHIFTME'; FillPercent = 70 }
+            @{ OffsetMB = 273; SizeMB = 512; FileSystem = 'NTFS'; Label = 'SHIFTME'; FillPercent = 70 }
         )
     }
 
@@ -41,21 +45,21 @@
         Description  = 'Three partitions on a 4K native disk.'
         Style        = 'GPT'
         SectorFormat = '4Kn'
-        DiskSizeMB   = 4096
+        DiskSizeMB   = 2048
         Partitions   = @(
-            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'A'; FillPercent = 40 }
-            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'B'; FillPercent = 90 }
-            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'C'; FillPercent = 10 }
+            @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'A'; FillPercent = 40 }
+            @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'B'; FillPercent = 90 }
+            @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'C'; FillPercent = 10 }
         )
     }
 
     'gpt-512n-tight' = @{
-        Description  = 'About 49 MiB free after the partition and nothing else: a move right uses all of it, so no sectors lie outside the move ranges (plan gap G5).'
+        Description  = 'About 49 MiB free after the partition and nothing else: a move right uses nearly all of it, so almost no sectors lie outside the move ranges (plan gap G5).'
         Style        = 'GPT'
         SectorFormat = '512n'
-        DiskSizeMB   = 1090
+        DiskSizeMB   = 578
         Partitions   = @(
-            @{ SizeMB = 1024; FileSystem = 'NTFS'; Label = 'FULL'; FillPercent = 60 }
+            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'FULL'; FillPercent = 60 }
         )
     }
 
@@ -63,9 +67,9 @@
         Description  = 'MBR equivalent of gpt-512n-single (MountedDevices uses signature + offset, plan gap G1).'
         Style        = 'MBR'
         SectorFormat = '512n'
-        DiskSizeMB   = 2048
+        DiskSizeMB   = 1024
         Partitions   = @(
-            @{ SizeMB = 1024; FileSystem = 'NTFS'; Label = 'DATA1'; FillPercent = 60 }
+            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'DATA1'; FillPercent = 60 }
         )
     }
 
@@ -73,11 +77,11 @@
         Description  = 'MBR equivalent of gpt-512e-boxed-in.'
         Style        = 'MBR'
         SectorFormat = '512e'
-        DiskSizeMB   = 4096
+        DiskSizeMB   = 2048
         Partitions   = @(
-            @{ SizeMB = 768; FileSystem = 'NTFS'; Label = 'LEFT';   FillPercent = 50 }
-            @{ SizeMB = 768; FileSystem = 'NTFS'; Label = 'TARGET'; FillPercent = 80 }
-            @{ SizeMB = 512; FileSystem = 'NTFS'; Label = 'RIGHT';  FillPercent = 50 }
+            @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'LEFT';   FillPercent = 50 }
+            @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'TARGET'; FillPercent = 80 }
+            @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'RIGHT';  FillPercent = 50 }
         )
     }
 }

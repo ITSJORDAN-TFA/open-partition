@@ -13,10 +13,16 @@
 
 .PARAMETER Integration
     Also run tests that create and mount VHDX disks (slow; needs admin + Hyper-V).
+
+.PARAMETER WorkDir
+    Where test VHDX disks and journals are created. Put this on a fast SSD/NVMe drive: the
+    integration tests write and read several GB. Defaults to $env:OPM_HARNESS_WORKDIR, then
+    tests\harness\out.
 #>
 param(
     [string] $Suite = '*',
-    [switch] $Integration
+    [switch] $Integration,
+    [string] $WorkDir = $env:OPM_HARNESS_WORKDIR
 )
 
 Set-StrictMode -Version Latest
@@ -26,7 +32,10 @@ Import-Module (Join-Path $PSScriptRoot 'OpenPartition.Harness.psm1') -Force
 $env:OPM_HARNESS_INTEGRATION = if ($Integration) { '1' } else { '' }
 $outDir = Join-Path $PSScriptRoot 'out'
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-$env:OPM_HARNESS_OUT = $outDir
+if (-not $WorkDir) { $WorkDir = $outDir }
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+$env:OPM_HARNESS_OUT = (Resolve-Path $WorkDir).Path
+Write-Host "Test disks go in $env:OPM_HARNESS_OUT"
 
 $results = [System.Collections.Generic.List[object]]::new()
 foreach ($file in Get-ChildItem (Join-Path $PSScriptRoot 'suites') -Filter "$Suite.Tests.ps1" | Sort-Object Name) {

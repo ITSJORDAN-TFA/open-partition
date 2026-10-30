@@ -175,6 +175,40 @@ function Write-DeterministicData {
     }
 }
 
+function Test-DeterministicData {
+    <#
+        Regenerates the files Write-DeterministicData wrote and compares them byte for byte.
+        Returns a list of problems (empty when every file matches). $Root may be a volume
+        GUID path such as \\?\Volume{...}\, so no drive letter is needed.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [long] $TargetBytes,
+        [Parameter(Mandatory)] [int] $Seed
+    )
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $random = [System.Random]::new($Seed)
+    $written = 0L
+    $index = 0
+    while ($written -lt $TargetBytes) {
+        $file = Join-Path (Join-Path $Root ('d{0:D3}' -f ($index % 37))) ('f{0:D6}.bin' -f $index)
+        $size = [long][Math]::Min($TargetBytes - $written, 4KB * [Math]::Pow(2, $random.Next(0, 12)))
+        $expected = [byte[]]::new($size)
+        $random.NextBytes($expected)
+        try {
+            $actual = [System.IO.File]::ReadAllBytes($file)
+            if (-not [System.Linq.Enumerable]::SequenceEqual($expected, $actual)) { $problems.Add("$file differs") }
+        }
+        catch {
+            $problems.Add("$file unreadable: $($_.Exception.Message)")
+        }
+        if ($problems.Count -ge 10) { $problems.Add('...stopping after 10 problems'); break }
+        $written += $size
+        $index++
+    }
+    return $problems
+}
+
 function New-TestDisk {
     <#
         Creates a VHDX from a catalogue layout, fills it with deterministic data and writes
@@ -197,6 +231,7 @@ function New-TestDisk {
         -LogicalSectorSizeBytes $format.Logical -PhysicalSectorSizeBytes $format.Physical | Out-Null
 
     $mountRoot = Join-Path ([System.IO.Path]::GetTempPath()) "opm-harness-$([guid]::NewGuid())"
+    $dataSets = [System.Collections.Generic.List[object]]::new()
     $vhd = Mount-VHD -Path $Path -NoDriveLetter -Passthru
     try {
         $diskNumber = $vhd.DiskNumber
@@ -224,6 +259,7 @@ function New-TestDisk {
                     $volume = $partition | Get-Volume
                     $target = [long]($volume.Size * $p.FillPercent / 100)
                     Write-DeterministicData -Root $mount -TargetBytes $target -Seed ($Seed * 1000 + $index)
+                    $dataSets.Add([ordered] @{ Label = $p.Label; Seed = $Seed * 1000 + $index; Bytes = $target })
                 }
                 finally {
                     $partition | Remove-PartitionAccessPath -AccessPath $mount
@@ -247,6 +283,7 @@ function New-TestDisk {
     }
     $manifest.Layout = $Layout
     $manifest.Seed = $Seed
+    $manifest.Data = @($dataSets)
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path "$Path.manifest.json" -Encoding utf8
     return $manifest
 }
@@ -303,5 +340,5 @@ function Start-RandomHardStop {
     }
 }
 
-Export-ModuleMember -Function Skip-Test, Test-HarnessHostReady, Get-TestLayout, Test-LayoutDefinition,
+Export-ModuleMember -Function Skip-Test, Test-HarnessHostReady, Get-TestLayout, Test-LayoutDefinition, Test-DeterministicData,
     Get-RawRangeHash, Get-TestDiskManifest, New-TestDisk, Invoke-InGuest, Wait-GuestReady, Start-RandomHardStop
