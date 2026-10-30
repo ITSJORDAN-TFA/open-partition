@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 opm-core = { path = "../opm-core" }
+sha2 = "0.10"
 
 [lints]
 workspace = true

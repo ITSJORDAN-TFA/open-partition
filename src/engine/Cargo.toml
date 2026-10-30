@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["opm-core", "opm-platform-sim", "opm-platform-win32", "opm-ffi"]
+members = ["opm-core", "opm-platform-sim", "opm-platform-win32", "opm-ffi", "opm-engine-cli"]
 
 [workspace.package]
 version = "0.0.1"

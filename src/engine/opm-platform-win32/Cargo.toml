@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 opm-core = { path = "../opm-core" }
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security"] }
 
 # Raw disk access needs FFI, so this crate (and opm-ffi) are the only ones allowed `unsafe`.
 [lints.rust]

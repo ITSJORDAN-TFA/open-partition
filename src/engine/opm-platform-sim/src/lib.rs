@@ -10,6 +10,8 @@ mod campaign;
 mod disk;
 mod rng;
 
-pub use campaign::{run_campaign, CampaignFailure, CampaignReport};
-pub use disk::{LossModel, SimDisk};
+pub use campaign::{
+    run_campaign, CampaignFailure, CampaignOptions, CampaignReport, CrashAware, SimWorld,
+};
+pub use disk::{LossModel, Power, SimDisk};
 pub use rng::XorShift64;

@@ -1,0 +1,19 @@
+[package]
+name = "opm-engine-cli"
+description = "Command-line driver for the move engine. Writes only to VHD/VHDX test disks in this build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "opm-engine"
+path = "src/main.rs"
+
+[dependencies]
+opm-core = { path = "../opm-core" }
+opm-platform-win32 = { path = "../opm-platform-win32" }
+
+[lints]
+workspace = true
