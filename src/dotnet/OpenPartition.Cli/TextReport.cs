@@ -28,7 +28,7 @@ internal static class TextReport
         ? $"Azure ({string.Join(", ", new[] { a.VmName, a.VmSize, a.Location }.Where(x => !string.IsNullOrEmpty(x)))})"
         : s.Environment.ToString();
 
-    private static void WriteDisk(TextWriter o, DiskInfo disk, bool detail)
+    internal static void WriteDisk(TextWriter o, DiskInfo disk, bool detail)
     {
         var flags = new List<string>();
         if (disk.IsBoot) flags.Add("boot");

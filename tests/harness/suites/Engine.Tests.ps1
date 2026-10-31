@@ -574,3 +574,92 @@ function Test-OpmGrowsLastLogicalDrive {
         Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
     }
 }
+
+function Test-OpmAppliesAPlanFile {
+    <#
+        The Azure field case as one plan file: `opm plan add` the extended-partition move, the
+        primary move and the SYS extend (each checked against the layout the earlier steps
+        leave), preview it, then `opm apply --yes --json`. Checks the JSON lines, the result on
+        disk and every file, and that the same plan is refused once the disk has changed.
+    #>
+    Assert-EngineHost
+    $layout = 'mbr-512n-logical-boxed-in'
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $path = Join-Path $env:OPM_HARNESS_OUT "opm-plan-$id.vhdx"
+    $plan = Join-Path $env:OPM_HARNESS_OUT "opm-plan-$id.json"
+    try {
+        $manifest = New-TestDisk -Layout $layout -Path $path -Seed 29
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        $disk = $vhd.DiskNumber
+        $labels = @($manifest.Data | ForEach-Object Label)
+        $paths = @{}
+        foreach ($label in $labels) { $paths[$label] = (Find-PartitionByLabel -DiskNumber $disk -Label $label).Volume.Path }
+        $sys = (Find-PartitionByLabel -DiskNumber $disk -Label 'SYS').Partition
+        $primary = (Find-PartitionByLabel -DiskNumber $disk -Label 'PRIM').Partition
+        $extended = Get-Partition -DiskNumber $disk | Where-Object Type -eq 'Extended'
+        $layoutBefore = @(Get-Partition -DiskNumber $disk | ForEach-Object { "$($_.Offset)/$($_.Size)" })
+
+        $steps = @(
+            , @('plan', 'new', $plan)
+            # Two moves of the extended partition in a row merge into one step.
+            , @('plan', 'add', $plan, 'move', $disk, 'extended', '--to', ($extended.Offset + 16MB))
+            , @('plan', 'add', $plan, 'move', $disk, 'extended', '--to', 'end')
+            , @('plan', 'add', $plan, 'move', $disk, "@$($primary.Offset)", '--to', 'end')
+            , @('plan', 'add', $plan, 'extend', $disk, "@$($sys.Offset)")
+        )
+        foreach ($arguments in $steps) {
+            $r = Invoke-Opm $arguments
+            if ($r.ExitCode -ne 0) { throw "opm $($arguments -join ' ') failed: $($r.Output -join ' | ')" }
+        }
+        $saved = Get-Content $plan -Raw | ConvertFrom-Json
+        if ($saved.format -ne 1) { throw "Plan file format is $($saved.format), expected 1." }
+        $kinds = @($saved.steps | ForEach-Object kind) -join ','
+        if ($kinds -ne 'move,move,extend') { throw "Plan steps are $kinds, expected move,move,extend (the two extended moves merged)." }
+
+        $show = Invoke-Opm @('plan', 'show', $plan)
+        if ($show.ExitCode -ne 0 -or -not ($show.Output -match 'After the plan')) { throw "opm plan show failed: $($show.Output -join ' | ')" }
+        $dry = Invoke-Opm @('apply', $plan, '--json')
+        if ($dry.ExitCode -ne 0 -or -not ($dry.Output -match '"event":"dry-run"')) { throw "opm apply dry run failed: $($dry.Output -join ' | ')" }
+        $layoutNow = @(Get-Partition -DiskNumber $disk | ForEach-Object { "$($_.Offset)/$($_.Size)" })
+        if (($layoutNow -join ',') -ne ($layoutBefore -join ',')) { throw 'A dry run changed the disk.' }
+
+        $r = Invoke-Opm @('apply', $plan, '--yes', '--json')
+        $events = @($r.Output | Where-Object { $_.StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+        $result = $events | Where-Object event -eq 'result'
+        if ($r.ExitCode -ne 0 -or -not $result -or -not $result.succeeded -or $result.completed -ne 3) { throw "opm apply failed: $($r.Output -join ' | ')" }
+        if ($events[-1].event -ne 'result') { throw 'The result is not the last JSON line.' }
+        foreach ($index in 1..3) {
+            if (-not ($events | Where-Object { $_.event -eq 'progress' -and $_.index -eq $index })) { throw "No progress lines for step $index." }
+        }
+        if (@($r.Output | Where-Object { $_ -and -not $_.StartsWith('{') }).Count) { throw "Non-JSON output with --json: $($r.Output -join ' | ')" }
+
+        $sysNow = (Find-PartitionByLabel -DiskNumber $disk -Label 'SYS').Partition
+        $primNow = (Find-PartitionByLabel -DiskNumber $disk -Label 'PRIM').Partition
+        if ($sysNow.Offset + $sysNow.Size -ne $primNow.Offset) { throw "SYS ends at $($sysNow.Offset + $sysNow.Size), PRIM starts at $($primNow.Offset): space left between them." }
+        foreach ($label in $labels) {
+            if ((Find-PartitionByLabel -DiskNumber $disk -Label $label).Volume.Path -ne $paths[$label]) { throw "$label volume GUID changed." }
+        }
+
+        # The disk changed, so the same plan must now be refused without touching it.
+        $again = Invoke-Opm @('apply', $plan, '--yes', '--json')
+        if ($again.ExitCode -eq 0 -or -not ($again.Output -match '"event":"error".*changed since this plan was made')) { throw "Re-applying a stale plan was not refused: $($again.Output -join ' | ')" }
+
+        Dismount-VHD -Path $path
+        $vhd = Mount-VHD -Path $path -ReadOnly -NoDriveLetter -Passthru
+        foreach ($data in $manifest.Data) {
+            $found = Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label $data.Label
+            $problems = @(Test-DeterministicData -Root $found.Volume.Path -TargetBytes $data.Bytes -Seed $data.Seed)
+            if ($problems.Count) { throw "$($data.Label): $($problems -join '; ')" }
+        }
+        Dismount-VHD -Path $path
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        foreach ($label in $labels) {
+            $scan = Repair-Volume -Path (Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label $label).Volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { throw "$label file system scan reported: $scan" }
+        }
+    }
+    finally {
+        Dismount-VHD -Path $path -ErrorAction SilentlyContinue
+        Remove-Item $path, "$path.manifest.json", $plan -ErrorAction SilentlyContinue
+    }
+}

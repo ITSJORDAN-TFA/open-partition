@@ -98,6 +98,17 @@ SYS by moving the extended partition and PRIM, extend SYS), including an engine 
 resume`; the GUI driven by UI Automation through the same flow
 (`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
+**Plan files (#16):** `opm plan new | add | show` and `opm apply` give the CLI the GUI's queue.
+`PlanFile` (Operations, pure) stores steps plus, per disk, the journal disk ID, size and a
+SHA-256 fingerprint of the partition layout taken when the disk's first step was added.
+`opm apply` finds disks by ID and size (disk numbers change across reboots), refuses on any
+fingerprint mismatch, then rebuilds every step with `Planner.Move/Extend` against the layout
+the earlier steps produce, so blockers that appeared since (BitLocker, page file) refuse too.
+The fingerprint leaves out volume contents on purpose; those are what the re-check covers.
+`Executor` now forwards step progress directly instead of through `Progress<T>`: in a console
+app `Progress<T>` posts to the thread pool, so lines could arrive out of order or after the
+result. The GUI is unaffected (its own `Progress<T>` still marshals to the UI thread).
+
 ---
 
 ## 1. Decisions to make now

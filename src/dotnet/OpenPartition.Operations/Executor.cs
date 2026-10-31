@@ -32,7 +32,10 @@ public static class Executor
             }
             var step = steps[i];
             var index = i;
-            var stepProgress = new Progress<StepProgress>(p => progress?.Report((index, p)));
+            // Forwarded as it comes rather than through Progress<T>, which would post each report to
+            // the thread pool and could deliver them out of order or after the run has finished.
+            // The caller's own IProgress decides where it lands (the GUI's posts to its UI thread).
+            var stepProgress = new Forward(p => progress?.Report((index, p)));
             try
             {
                 var disk = snapshot.Disks.FirstOrDefault(d => d.Number == step.DiskNumber)
@@ -64,5 +67,10 @@ public static class Executor
             }
         }
         return new RunResult(steps.Count, steps.Count, null, null);
+    }
+
+    private sealed class Forward(Action<StepProgress> report) : IProgress<StepProgress>
+    {
+        public void Report(StepProgress value) => report(value);
     }
 }
