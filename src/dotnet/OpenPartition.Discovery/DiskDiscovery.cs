@@ -157,6 +157,7 @@ public static class DiskDiscovery
                 MbrType = raw.MbrType,
                 IsActive = raw.BootIndicator,
                 IsLogical = isLogical,
+                EbrOffset = isLogical ? raw.EbrOffset : null,
                 IsBoot = flags.Boot || (volume is not null && string.Equals(volume.Path, bootVolume, StringComparison.OrdinalIgnoreCase)),
                 IsSystem = flags.System || role == PartitionRole.EfiSystem && wmi is null,
                 Volume = volume,

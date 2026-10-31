@@ -16,8 +16,8 @@ use opm_core::{
     MoveJob, MoveRecord, PartitionTable, Phase, Progress, Recovery, Stage,
 };
 use opm_platform_win32::{
-    copy_map, is_extended_type, lock_volumes_in, snapshot_records, FileJournal, PhysicalDisk,
-    PlatformError, WriteAccess,
+    copy_map, is_extended_type, lock_volumes_in, snapshot_records, FileJournal, Layout,
+    PhysicalDisk, PlatformError, WriteAccess,
 };
 
 const USAGE: &str = "\
@@ -171,7 +171,7 @@ fn info(o: &Options) -> Result<(), Failure> {
             e.number,
             e.offset,
             e.length,
-            layout.key_of(&e).is_some()
+            layout.key_of(&e).is_some() || layout.is_logical(&e)
         );
     }
     Ok(())
@@ -230,10 +230,14 @@ fn move_partition(o: &Options) -> Result<(), Failure> {
         .into_iter()
         .find(|e| e.offset == from)
         .ok_or_else(|| PlatformError::Refused(format!("no partition starts at byte {from}")))?;
-    let key = layout.key_of(&entry).ok_or_else(|| {
-        PlatformError::Refused(
-            "a logical drive cannot be moved on its own; move its extended partition".into(),
-        )
+    let key = if layout.is_logical(&entry) {
+        println!("logical_drive=yes");
+        Layout::logical_key(from, to)
+    } else {
+        layout.key_of(&entry)
+    }
+    .ok_or_else(|| {
+        PlatformError::Refused(format!("the partition at byte {from} can't be moved"))
     })?;
     if layout.is_container(&entry) {
         let logicals = layout

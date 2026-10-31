@@ -14,7 +14,8 @@ internal sealed record RawPartition(
     Guid? GptType,
     Guid? PartitionId,
     ulong GptAttributes,
-    string? GptName);
+    string? GptName,
+    long? EbrOffset = null);
 
 internal sealed record RawLayout(
     PartitionStyle Style,
@@ -71,6 +72,9 @@ internal static class LayoutParser
         }
 
         var partitions = new List<RawPartition>();
+        // Where each MBR partition table (group of four entries) sits: the MBR, then the EBR at
+        // the start of the extended partition, then wherever the previous group's link points.
+        var tables = new Dictionary<int, long> { [0] = 0 };
         for (var i = 0; i < count; i++)
         {
             var entry = data.Slice(LayoutHeaderSize + (i * PartitionEntrySize), PartitionEntrySize);
@@ -91,11 +95,17 @@ internal static class LayoutParser
                 // the logical-drive chain as a group of 4: the logical drive plus an extended
                 // entry linking to the next EBR. Those links are not partitions (Windows does
                 // not list them either); the primary extended entry is the container.
-                if (i >= 4 && MbrTypes.IsExtended(type))
+                if (MbrTypes.IsExtended(type))
                 {
-                    continue;
+                    // The next group's table: the container start for the first EBR.
+                    tables.TryAdd((i / 4) + 1, offset);
+                    if (i >= 4)
+                    {
+                        continue;
+                    }
                 }
-                partitions.Add(new RawPartition(number, offset, length, type, union[1] != 0, null, null, 0, null));
+                long? ebr = i >= 4 && tables.TryGetValue(i / 4, out var table) ? table : null;
+                partitions.Add(new RawPartition(number, offset, length, type, union[1] != 0, null, null, 0, null, ebr));
             }
             else if (style == PartitionStyle.Gpt)
             {

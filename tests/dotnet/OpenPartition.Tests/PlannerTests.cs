@@ -50,9 +50,9 @@ public class PlannerTests
             Part(2, c, 50 * GiB, 'C', boot: true),
             Part(3, i, 10 * GiB, 'I'),
             Part(0, ext, 65 * GiB + 3 * MiB, null, role: PartitionRole.Extended),
-            Part(4, ext + MiB, 25 * GiB, 'E', logical: true),
-            Part(5, ext + 25 * GiB + 2 * MiB, 10 * GiB, 'L', logical: true),
-            Part(6, ext + 35 * GiB + 3 * MiB, 30 * GiB, 'K', logical: true),
+            Part(4, ext + MiB, 25 * GiB, 'E', logical: true) with { EbrOffset = ext },
+            Part(5, ext + 25 * GiB + 2 * MiB, 10 * GiB, 'L', logical: true) with { EbrOffset = ext + 25 * GiB + MiB },
+            Part(6, ext + 35 * GiB + 3 * MiB, 30 * GiB, 'K', logical: true) with { EbrOffset = ext + 35 * GiB + 2 * MiB },
         };
         partitions = partitions.Select(p => p with { Issues = Classifier.ForPartition(p) }).ToList();
         const long size = 256 * GiB;
@@ -83,11 +83,102 @@ public class PlannerTests
     }
 
     [Fact]
-    public void LogicalDrivesOnlyMoveWithTheirExtendedPartition()
+    public void PackedLogicalDrivesHaveNoRoomToMoveButTheirExtendedPartitionDoes()
     {
         var disk = AzureLike();
-        Assert.NotEmpty(Planner.MoveBlockers(disk, Letter(disk, 'E')));
+        foreach (var letter in "ELK")
+        {
+            Assert.Equal(["There is no free space next to it to move into."], Planner.MoveBlockers(disk, Letter(disk, letter)));
+        }
         Assert.Empty(Planner.MoveBlockers(disk, Extended(disk)));
+    }
+
+    /// <summary>
+    /// Extended partition 1..11 GiB holding E: (first, 1 GiB at +1 MiB), L: (1 GiB at +3 GiB,
+    /// EBR 1 MiB before) and K: (1 GiB at +6 GiB, EBR 1 MiB before), with free space between.
+    /// </summary>
+    private static DiskInfo LogicalsWithGaps()
+    {
+        const long ext = GiB;
+        var partitions = new List<PartitionInfo>
+        {
+            Part(0, ext, 10 * GiB, null, role: PartitionRole.Extended),
+            Part(1, ext + MiB, GiB, 'E', logical: true) with { EbrOffset = ext },
+            Part(2, ext + 3 * GiB, GiB, 'L', logical: true) with { EbrOffset = ext + 3 * GiB - MiB },
+            Part(3, ext + 6 * GiB, GiB, 'K', logical: true) with { EbrOffset = ext + 6 * GiB - MiB },
+        };
+        const long size = 16 * GiB;
+        return new DiskInfo
+        {
+            Number = 1,
+            Size = size,
+            LogicalSectorSize = 512,
+            Style = PartitionStyle.Mbr,
+            UsableStart = 512,
+            UsableEnd = size,
+            Partitions = partitions,
+            FreeExtents = FreeSpace.Compute(512, size, partitions),
+        };
+    }
+
+    [Fact]
+    public void LogicalDriveMovesBetweenItsNeighboursKeepingRoomForEbrs()
+    {
+        const long ext = GiB;
+        var disk = LogicalsWithGaps();
+        // The first drive's EBR stays at the container start; it may go up to the next EBR.
+        Assert.Equal(new MoveRange(ext + MiB, ext + 2 * GiB - MiB), Planner.Range(disk, Letter(disk, 'E')));
+        // A later drive takes its EBR along, 1 MiB in front, so it can't start right after E:.
+        Assert.Equal(new MoveRange(ext + GiB + 2 * MiB, ext + 5 * GiB - MiB), Planner.Range(disk, Letter(disk, 'L')));
+        // The last one may go up to the end of the extended partition.
+        Assert.Equal(new MoveRange(ext + 4 * GiB + MiB, ext + 9 * GiB), Planner.Range(disk, Letter(disk, 'K')));
+        Assert.Throws<PlanException>(() => Planner.Move(disk, Letter(disk, 'L'), ext + 5 * GiB));
+        Assert.Throws<PlanException>(() => Planner.Move(disk, Letter(disk, 'L'), ext + GiB + MiB));
+    }
+
+    [Fact]
+    public void MovedLogicalDriveTakesItsEbrAlongInThePreview()
+    {
+        const long ext = GiB;
+        var disk = LogicalsWithGaps();
+        var move = Planner.Move(disk, Letter(disk, 'L'), ext + GiB + 2 * MiB);
+        Assert.Equal(ext + 3 * GiB, move.From);
+        Assert.Equal(GiB, move.Length);
+        disk = Planner.Apply(disk, move);
+        var l = Letter(disk, 'L');
+        Assert.Equal((ext + GiB + 2 * MiB, ext + GiB + MiB), (l.Offset, l.EbrOffset));
+        Assert.Equal(ext + MiB, Letter(disk, 'E').Offset);
+        Assert.Equal(ext + 6 * GiB, Letter(disk, 'K').Offset);
+        // K: can now come down to just after L:'s new place.
+        Assert.Equal(ext + 2 * GiB + 3 * MiB, Planner.Range(disk, Letter(disk, 'K'))!.Min);
+
+        // Then the whole extended partition: every EBR moves with it, the first one included.
+        var extended = Extended(disk);
+        disk = Planner.Apply(disk, Planner.Move(disk, extended, 4 * GiB));
+        var delta = 3 * GiB;
+        Assert.Equal(4 * GiB, Letter(disk, 'E').EbrOffset);
+        Assert.Equal(ext + GiB + MiB + delta, Letter(disk, 'L').EbrOffset);
+    }
+
+    [Fact]
+    public void TwoMovesOfOneLogicalDriveFoldIntoOne()
+    {
+        const long ext = GiB;
+        var disk = LogicalsWithGaps();
+        var first = Planner.Move(disk, Letter(disk, 'K'), ext + 7 * GiB);
+        var second = Planner.Move(Planner.Apply(disk, first), Letter(Planner.Apply(disk, first), 'K'), ext + 8 * GiB);
+        var queue = Planner.Append(disk, Planner.Append(disk, [], first), second);
+        var only = Assert.IsType<MoveStep>(Assert.Single(queue));
+        Assert.Equal((ext + 6 * GiB, ext + 8 * GiB), (only.From, only.To));
+    }
+
+    [Fact]
+    public void LogicalDriveWithAnUnknownEbrIsNotMoved()
+    {
+        var disk = LogicalsWithGaps();
+        disk = disk with { Partitions = disk.Partitions.Select(p => p.Volume?.DriveLetter == 'L' ? p with { EbrOffset = null } : p).ToList() };
+        Assert.Null(Planner.Range(disk, Letter(disk, 'L')));
+        Assert.Null(Planner.Range(disk, Letter(disk, 'K')));
     }
 
     [Fact]

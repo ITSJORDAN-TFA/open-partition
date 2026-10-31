@@ -73,10 +73,11 @@ public class ClassifierTests
     }
 
     [Fact]
-    public void LogicalDriveCannotBeMovedOnItsOwnButCanBeExtended()
+    public void LogicalDriveCanBeMovedAndExtended()
     {
         var issues = Classifier.ForPartition(Data(Volume()) with { IsLogical = true });
-        Assert.True(Blocks(issues, "partition.logical", OperationKind.Move));
+        Assert.False(Blocks(issues, "partition.logical", OperationKind.Move));
+        Assert.Contains(issues, i => i.Code == "partition.logical" && i.Severity == IssueSeverity.Info);
         Assert.False(Blocks(issues, "partition.logical", OperationKind.Extend));
     }
 
@@ -130,9 +131,9 @@ public class ClassifierTests
     }
 
     [Fact]
-    public void LogicalDriveCannotMove()
+    public void LogicalDriveIsNotBlockedFromMoving()
     {
-        Assert.True(Blocks(Classifier.ForPartition(Data(Volume()) with { IsLogical = true }), "partition.logical", OperationKind.Move));
+        Assert.False(Blocks(Classifier.ForPartition(Data(Volume()) with { IsLogical = true }), "partition.logical", OperationKind.Move));
     }
 
     [Theory]
