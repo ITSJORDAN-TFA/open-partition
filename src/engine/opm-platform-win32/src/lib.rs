@@ -27,7 +27,8 @@ pub use error::PlatformError;
 pub use guard::{bus_type, WriteAccess, BUS_TYPE_FILE_BACKED_VIRTUAL};
 pub use journal_file::FileJournal;
 pub use layout::{
-    is_extended_type, snapshot_records, Layout, LayoutEntry, LayoutStyle, SnapshotRecord,
+    insert_and_write_ebr, is_extended_type, snapshot_records, Layout, LayoutEntry, LayoutStyle,
+    SnapshotRecord,
 };
 pub use smbios::is_azure_vm;
 pub use volume::{find_volumes_in, lock_volumes_in, LockedVolume};
