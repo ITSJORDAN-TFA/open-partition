@@ -300,3 +300,20 @@ Shipped since the "Operations in the GUI and CLI" section above:
   - Drag-to-place Move/Extend dialogs with exact MiB fields and a whole-disk strip.
 - **Releases:** CI publishes `openpartition-<version>-win-x64.zip` to GitHub Releases (tags
   `v*`), and a rolling `preview` pre-release from `main`.
+
+
+### Move throughput estimates (#10)
+
+Read-only `opm-engine bench` measures the same parallel read path as moves, without acquiring
+write access. Apply measures each move's source and shows a conservative full-range estimate:
+four transfers per byte (fingerprint, copy read/write, read-back) plus eight seconds for volume
+locking, table updates and device re-enumeration. The original two-second allowance underestimated
+a small VHDX move (2.59 s estimated vs 9.12 s actual); eight seconds gave 8.38 s vs 5.19 s.
+This is an approximation, not a deadline: read speed does not measure write/flush latency or
+hashing cost. Azure disk tier and VM aggregate limits both matter. Free-space skipping may reduce
+actual duration, but discovery free counts cannot prove a locked bitmap will be available.
+Live copy rates include verification time; normal moves have no separate final verify pass.
+Recovered moves can have a final verification stage. Progress refreshes every two seconds while
+waiting for a chunk; a stalled checkpoint reports ETA unavailable rather than inventing progress.
+The targeted Throughput VHDX suite does not interrupt processes. The full existing integration
+suite includes process-kill tests and must run on a disposable host where those are authorized.

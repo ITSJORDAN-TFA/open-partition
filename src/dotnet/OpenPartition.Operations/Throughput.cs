@@ -15,12 +15,11 @@ public static class Throughput
     /// </summary>
     public const int MovePasses = 4;
 
-    /// <summary>Locking volumes, updating the partition table and journal: a few seconds per move.</summary>
-    public static readonly TimeSpan MoveOverhead = TimeSpan.FromSeconds(2);
+    /// <summary>Locking volumes, updating the partition table and journal: an eight-second allowance per move (VHDX timing includes device re-enumeration).</summary>
+    public static readonly TimeSpan MoveOverhead = TimeSpan.FromSeconds(8);
 
     /// <summary>
-    /// Bytes the move copies: the partitions moving, less the free space of their NTFS volumes
-    /// (the engine skips free NTFS clusters). The whole length when that isn't known.
+    /// Conservative bytes to copy: allow the full range until a locked-volume bitmap is known.
     /// </summary>
     public static long BytesToCopy(SystemSnapshot snapshot, MoveStep step)
     {
@@ -55,7 +54,7 @@ public static class Throughput
         _ => "",
     };
 
-    /// <summary>Transfers per progress byte in a stage: copying reads and writes, the others only read.</summary>
+    /// <summary>Transfers per progress byte in a stage: copying reads, writes and reads back; other stages only read.</summary>
     internal static int Weight(string? stage) => stage == "copying" ? 3 : 1;
 
     /// <summary>The stages of a verified move still to come after <paramref name="stage"/>.</summary>

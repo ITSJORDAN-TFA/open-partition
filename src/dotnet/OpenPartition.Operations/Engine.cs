@@ -145,6 +145,8 @@ public static class Engine
         var log = Path.ChangeExtension(journal, ".log");
         var meter = new ThroughputMeter();
         var clock = Stopwatch.StartNew();
+        string? currentStage = null;
+        long currentDone = 0, currentTotal = 0;
         var result = await ExecAsync(args, snapshot, cancellationToken, line =>
         {
             File.AppendAllLines(log, [line]);
@@ -154,6 +156,9 @@ public static class Engine
                 if (values.TryGetValue("bytes", out var bytes) && bytes.Split('/') is [var done, var total] && Long(total) > 0)
                 {
                     var stage = values.GetValueOrDefault("stage");
+                    currentStage = stage;
+                    currentDone = Long(done);
+                    currentTotal = Long(total);
                     var (rate, left) = meter.Sample(stage, Long(done), Long(total), clock.Elapsed);
                     progress?.Report(new StepProgress((double)Long(done) / Long(total), ProgressText(stage, Long(done), Long(total)) + Throughput.Describe(rate, left)));
                 }
@@ -170,6 +175,13 @@ public static class Engine
                 progress?.Report(new StepProgress(null,
                     $"Only the {Model.Units.FormatBytes(Long(copy))} that hold data are copied; the {Model.Units.FormatBytes(Long(length) - Long(copy))} of free space is skipped"));
             }
+        }, () =>
+        {
+            if (currentTotal <= 0) return;
+            var (rate, left) = meter.Sample(currentStage, currentDone, currentTotal, clock.Elapsed);
+            progress?.Report(new StepProgress((double)currentDone / currentTotal,
+                ProgressText(currentStage, currentDone, currentTotal) +
+                (rate is null ? " (0 MB/s since last checkpoint; waiting for the next verified chunk, ETA unavailable)" : Throughput.Describe(rate, left))));
         }).ConfigureAwait(false);
         if (result.ExitCode != 0)
         {
@@ -205,7 +217,7 @@ public static class Engine
 
     private sealed record ExecResult(int ExitCode, IReadOnlyList<string> Lines);
 
-    private static async Task<ExecResult> ExecAsync(List<string> args, string? snapshot, CancellationToken cancellationToken, Action<string>? onLine = null)
+    private static async Task<ExecResult> ExecAsync(List<string> args, string? snapshot, CancellationToken cancellationToken, Action<string>? onLine = null, Action? onIdle = null)
     {
         var start = new ProcessStartInfo(ExecutablePath)
         {
@@ -232,8 +244,16 @@ public static class Engine
         using var process = Process.Start(start) ?? throw new OperationFailedException("opm-engine could not be started.");
         var lines = new List<string>();
         var stderr = process.StandardError.ReadToEndAsync(cancellationToken);
-        while (await process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        while (true)
         {
+            var read = process.StandardOutput.ReadLineAsync(cancellationToken).AsTask();
+            while (!read.IsCompleted)
+            {
+                if (await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(2), cancellationToken)).ConfigureAwait(false) == read) break;
+                cancellationToken.ThrowIfCancellationRequested();
+                onIdle?.Invoke();
+            }
+            if (await read.ConfigureAwait(false) is not { } line) break;
             lines.Add(line);
             onLine?.Invoke(line);
         }

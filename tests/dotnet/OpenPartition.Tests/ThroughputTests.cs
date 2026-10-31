@@ -11,13 +11,17 @@ public class ThroughputTests
 
     private static SystemSnapshot Snapshot(params PartitionInfo[] partitions) => new()
     {
+        CollectedAt = DateTimeOffset.UtcNow,
+        MachineName = "test",
+        OsVersion = "test",
+        IsElevated = false,
         Disks =
         [
             new DiskInfo
             {
                 Number = 1,
                 Size = 100 * GiB,
-                SectorSize = 512,
+                LogicalSectorSize = 512,
                 PhysicalSectorSize = 512,
                 Style = PartitionStyle.Gpt,
                 BusType = "SAS",
@@ -44,7 +48,7 @@ public class ThroughputTests
     };
 
     [Fact]
-    public void Free_space_is_conservative_until_a_locked_bitmap_is_available()
+    public void FreeSpaceIsConservativeUntilALockedBitmapIsAvailable()
     {
         var snapshot = Snapshot(Part(GiB, 10 * GiB, "NTFS", 6 * GiB));
         var step = new MoveStep(1, "D:", GiB, 20 * GiB, 10 * GiB);
@@ -52,7 +56,7 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void Unknown_free_space_or_other_file_systems_copy_everything()
+    public void UnknownFreeSpaceOrOtherFileSystemsCopyEverything()
     {
         Assert.Equal(10 * GiB, Throughput.BytesToCopy(Snapshot(Part(GiB, 10 * GiB, "NTFS", null)), new MoveStep(1, "D:", GiB, 20 * GiB, 10 * GiB)));
         Assert.Equal(10 * GiB, Throughput.BytesToCopy(Snapshot(Part(GiB, 10 * GiB, "FAT32", 6 * GiB)), new MoveStep(1, "D:", GiB, 20 * GiB, 10 * GiB)));
@@ -60,7 +64,7 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void An_extended_partition_estimate_allows_for_full_copy_fallback()
+    public void AnExtendedPartitionEstimateAllowsForFullCopyFallback()
     {
         var snapshot = Snapshot(
             Part(GiB, 10 * GiB, null, null, role: PartitionRole.Extended),
@@ -70,7 +74,7 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void A_move_transfers_every_copied_byte_four_times()
+    public void AMoveTransfersEveryCopiedByteFourTimes()
     {
         // 1 GiB at 100 MiB/s: fingerprint 10 s, copy (read + write) 20 s, check 10 s.
         var estimate = Throughput.EstimateMove(GiB, 100 * MiB);
@@ -83,11 +87,11 @@ public class ThroughputTests
     [InlineData(70, "about a minute")]
     [InlineData(4 * 60 + 10, "about 4 minutes")]
     [InlineData(80 * 60, "about 1 h 20 min")]
-    public void Durations_read_naturally(int seconds, string expected) =>
+    public void DurationsReadNaturally(int seconds, string expected) =>
         Assert.Equal(expected, Throughput.FormatDuration(TimeSpan.FromSeconds(seconds)));
 
     [Fact]
-    public void The_first_progress_line_has_no_rate_yet()
+    public void TheFirstProgressLineHasNoRateYet()
     {
         var meter = new ThroughputMeter();
         Assert.Equal((null, null), meter.Sample("copying", 128 * MiB, GiB, TimeSpan.FromSeconds(1)));
@@ -95,28 +99,28 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void Copying_rate_and_time_left_include_the_check_that_follows()
+    public void CopyingRateIncludesVerificationAlreadyDoneInEachChunk()
     {
         var meter = new ThroughputMeter();
         meter.Sample("copying", 0, 1000 * MiB, TimeSpan.Zero);
         var (rate, left) = meter.Sample("copying", 200 * MiB, 1000 * MiB, TimeSpan.FromSeconds(2));
         Assert.Equal(100.0 * MiB, rate!.Value, 3);
-        // 800 MiB left to copy at 100 MiB/s (8 s), then 1000 MiB to read back at twice that (5 s).
+        // 800 MiB left at 100 MiB/s; each chunk has already been read back.
         Assert.Equal(8, left!.Value.TotalSeconds, 3);
     }
 
     [Fact]
-    public void Hashing_time_left_includes_copying_and_checking()
+    public void HashingTimeLeftIncludesVerifiedCopying()
     {
         var meter = new ThroughputMeter();
         meter.Sample("hashing", 0, 1000 * MiB, TimeSpan.Zero);
         var (_, left) = meter.Sample("hashing", 500 * MiB, 1000 * MiB, TimeSpan.FromSeconds(1));
-        // 0.5 s of hashing left, 4 s to copy (read + write), 2 s to check.
-        Assert.Equal(6.5, left!.Value.TotalSeconds, 3);
+        // 1 s of hashing left, then 6 s to read, write and verify the copy.
+        Assert.Equal(7, left!.Value.TotalSeconds, 3);
     }
 
     [Fact]
-    public void A_new_stage_starts_a_new_rate_and_the_rate_follows_recent_speed()
+    public void ANewStageStartsANewRateAndTheRateFollowsRecentSpeed()
     {
         var meter = new ThroughputMeter { Window = TimeSpan.FromSeconds(10) };
         meter.Sample("hashing", 0, 1000 * MiB, TimeSpan.Zero);
@@ -136,7 +140,7 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void Slow_chunks_still_give_a_rate()
+    public void SlowChunksStillGiveARate()
     {
         // One chunk every 15 s, longer than the window: the previous sample is kept.
         var meter = new ThroughputMeter { Window = TimeSpan.FromSeconds(10) };
@@ -147,6 +151,24 @@ public class ThroughputTests
     }
 
     [Fact]
-    public void Progress_text_shows_speed_and_time_left() =>
+    public void ProgressTextShowsSpeedAndTimeLeft() =>
         Assert.Equal($" ({Units.FormatBytes(100 * MiB)}/s, about 3 minutes left)", Throughput.Describe(100 * MiB, TimeSpan.FromMinutes(3)));
+    [Fact]
+    public void IdleSamplesReduceTheRateWithoutInventingCompletedBytes()
+    {
+        var meter = new ThroughputMeter();
+        meter.Sample("copying", 0, 1000 * MiB, TimeSpan.Zero);
+        meter.Sample("copying", 100 * MiB, 1000 * MiB, TimeSpan.FromSeconds(1));
+        var (rate, left) = meter.Sample("copying", 100 * MiB, 1000 * MiB, TimeSpan.FromSeconds(5));
+        Assert.Equal(20.0 * MiB, rate!.Value, 3);
+        Assert.Equal(45, left!.Value.TotalSeconds, 3);
+    }
+
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(-1)]
+    public void InvalidBenchmarkRatesAreRejected(double rate) =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => Throughput.EstimateMove(GiB, rate));
+
 }
