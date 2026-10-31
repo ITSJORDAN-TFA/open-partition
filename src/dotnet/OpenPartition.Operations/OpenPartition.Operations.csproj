@@ -1,8 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />
     <ProjectReference Include="../OpenPartition.Discovery/OpenPartition.Discovery.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="OpenPartition.Tests" />
   </ItemGroup>
 
 </Project>
