@@ -274,7 +274,8 @@ function Test-MoveRound([string] $Name, [bool] $Kill) {
             $copyBytes = if ($r.Output -match 'copy_bytes=(\d+)') { [long]$Matches[1] } else { 0 }
             # The volume is 60% full: its free space must be skipped, not copied.
             if ($copyBytes -ge $partition.Size) { throw "free space was not skipped: copied $copyBytes of $($partition.Size) bytes ($(($r.Output -split "`n" | Where-Object { $_ -like 'locked=*' }) -join ' '))" }
-            $detail = "moved $([Math]::Round(($to - $from) / 1MB, 2)) MiB right (from offset $from), copying $([Math]::Round($copyBytes / 1MB)) MiB of $([Math]::Round($partition.Size / 1MB)) MiB"
+            $source = if ($r.Output -match 'free_source=(\S+)') { $Matches[1] } else { 'none' }
+            $detail = "moved $([Math]::Round(($to - $from) / 1MB, 2)) MiB right (from offset $from), copying $([Math]::Round($copyBytes / 1MB)) MiB of $([Math]::Round($partition.Size / 1MB)) MiB (free space from $source)"
         }
         $seconds = [Math]::Round(((Get-Date) - $start).TotalSeconds, 1)
 
