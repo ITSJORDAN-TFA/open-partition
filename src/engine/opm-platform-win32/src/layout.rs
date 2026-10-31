@@ -1071,4 +1071,322 @@ mod tests {
             Err(IoError::Os(183))
         );
     }
+
+    const MIB: u64 = 1 << 20;
+
+    /// Primary at 1 MiB; extended partition 64..576 MiB holding three logical drives laid out
+    /// the way Windows creates them (EBR, then the drive 1 MiB later except for the first):
+    /// L1 72..96 MiB (EBR at 64), L2 129..161 MiB (EBR at 128), L3 257..320 MiB (EBR at 256).
+    fn three_logicals() -> Layout {
+        let mut raw = vec![0u8; HEADER + 16 * ENTRY];
+        raw[4..8].copy_from_slice(&16u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut put = |i: usize, offset: u64, length: u64, kind: u8, hidden: u64| {
+            let b = HEADER + i * ENTRY;
+            raw[b + 8..b + 16].copy_from_slice(&offset.to_le_bytes());
+            raw[b + 16..b + 24].copy_from_slice(&length.to_le_bytes());
+            raw[b + 32] = kind;
+            raw[b + 36..b + 40].copy_from_slice(&((hidden / 512) as u32).to_le_bytes());
+        };
+        put(0, MIB, 32 * MIB, 0x07, MIB);
+        put(1, 64 * MIB, 512 * MIB, 0x05, 64 * MIB);
+        put(4, 72 * MIB, 24 * MIB, 0x07, 8 * MIB);
+        put(5, 128 * MIB, 33 * MIB, 0x05, 64 * MIB);
+        put(8, 129 * MIB, 32 * MIB, 0x07, MIB);
+        put(9, 256 * MIB, 64 * MIB, 0x05, 192 * MIB);
+        put(12, 257 * MIB, 63 * MIB, 0x07, MIB);
+        Layout::parse(raw).unwrap()
+    }
+
+    type Shape = Vec<(u64, u64, Option<u8>, u32)>;
+
+    /// Start, length, type and hidden sectors of every entry, in order.
+    fn shape(layout: &Layout) -> Shape {
+        layout
+            .entries()
+            .iter()
+            .map(|e| {
+                let hidden = u32_at(&layout.raw, layout.entry_base(e.index) + MBR_HIDDEN);
+                (e.offset, e.length, e.mbr_type, hidden)
+            })
+            .collect()
+    }
+
+    fn logicals(layout: &Layout) -> Vec<(u64, u64)> {
+        let mut all: Vec<(u64, u64)> = layout
+            .entries()
+            .iter()
+            .filter(|e| layout.is_logical(e))
+            .map(|e| (e.offset, e.length))
+            .collect();
+        all.sort_unstable();
+        all
+    }
+
+    /// The layout as Windows would read it back after writing it to disk.
+    fn reread(layout: &Layout) -> Layout {
+        let sectors: std::collections::HashMap<u64, Vec<u8>> =
+            layout.table_sectors(512).into_iter().collect();
+        Layout::read_mbr(512, |at| {
+            Ok(sectors.get(&at).cloned().unwrap_or_else(|| vec![0; 512]))
+        })
+        .unwrap()
+    }
+
+    /// Table sectors that differ between two layouts (added, removed or changed).
+    fn changed_tables(a: &Layout, b: &Layout) -> Vec<u64> {
+        let a: std::collections::BTreeMap<u64, Vec<u8>> =
+            a.table_sectors(512).into_iter().collect();
+        let b: std::collections::BTreeMap<u64, Vec<u8>> =
+            b.table_sectors(512).into_iter().collect();
+        let mut at: Vec<u64> = a.keys().chain(b.keys()).copied().collect();
+        at.sort_unstable();
+        at.dedup();
+        at.retain(|k| a.get(k) != b.get(k));
+        at
+    }
+
+    /// Move a logical drive in the layout the way the mover does: out, then back at `to`.
+    /// Returns the layout while it was out, and after.
+    fn move_logical(layout: &Layout, from: u64, to: u64) -> Result<(Layout, Layout), IoError> {
+        let key = Layout::logical_key(from, to).unwrap();
+        let entry = layout.find(key).unwrap();
+        let snapshot = layout.snapshot(&entry)?;
+        let mut out = layout.clone();
+        out.remove(&entry);
+        assert!(out.find(key).is_none());
+        assert_eq!(
+            shape(&reread(&out)),
+            shape(&out),
+            "chain readable while out"
+        );
+        assert!(out.range_is_free_for(key, from, entry.length));
+        let mut back = out.clone();
+        back.insert(key, &snapshot, to, 512)?;
+        Ok((out, back))
+    }
+
+    fn check_moved(before: &Layout, after: &Layout, from: u64, to: u64) {
+        let mut want: Vec<(u64, u64)> = logicals(before)
+            .into_iter()
+            .map(|(o, l)| (if o == from { to } else { o }, l))
+            .collect();
+        want.sort_unstable();
+        assert_eq!(logicals(after), want, "{from} -> {to}");
+        assert_eq!(shape(&reread(after)), shape(after), "chain on disk matches");
+        let key = Layout::logical_key(from, to).unwrap();
+        assert_eq!(after.find(key).map(|e| e.offset), Some(to));
+        let primary = |l: &Layout| {
+            l.entries()
+                .into_iter()
+                .filter(|e| e.index < 4)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(primary(before), primary(after), "MBR untouched");
+    }
+
+    #[test]
+    fn first_logical_moves_left_and_right_in_its_slot() {
+        let layout = three_logicals();
+        for to in [65 * MIB, 104 * MIB] {
+            let (out, after) = move_logical(&layout, 72 * MIB, to).unwrap();
+            check_moved(&layout, &after, 72 * MIB, to);
+            assert_eq!(
+                changed_tables(&layout, &out),
+                vec![64 * MIB],
+                "only the EBR at the container start changes"
+            );
+            assert_eq!(changed_tables(&layout, &after), vec![64 * MIB]);
+            let moved = after
+                .entries()
+                .into_iter()
+                .find(|e| e.offset == to)
+                .unwrap();
+            assert_eq!(moved.index, 4, "same slot");
+            assert_eq!(after.logical_ebr(to, 512), None, "its EBR never moves");
+        }
+    }
+
+    #[test]
+    fn middle_logical_moves_with_its_ebr() {
+        let layout = three_logicals();
+        for to in [200 * MIB, 110 * MIB] {
+            let (out, after) = move_logical(&layout, 129 * MIB, to).unwrap();
+            check_moved(&layout, &after, 129 * MIB, to);
+            assert_eq!(
+                changed_tables(&layout, &out),
+                vec![64 * MIB, 128 * MIB],
+                "unlinked: the previous EBR now skips it, and its own EBR is no longer read"
+            );
+            let ebr = to - MIB;
+            assert_eq!(
+                changed_tables(&out, &after),
+                vec![64 * MIB, ebr],
+                "linked back: the previous EBR and its new one"
+            );
+            let (at, sector) = after.logical_ebr(to, 512).unwrap();
+            let written: std::collections::HashMap<u64, Vec<u8>> =
+                after.table_sectors(512).into_iter().collect();
+            assert_eq!((at, Some(&sector)), (ebr, written.get(&ebr)));
+        }
+    }
+
+    #[test]
+    fn last_logical_moves_left_and_right() {
+        let layout = three_logicals();
+        for to in [400 * MIB, 200 * MIB, 162 * MIB] {
+            let (out, after) = move_logical(&layout, 257 * MIB, to).unwrap();
+            check_moved(&layout, &after, 257 * MIB, to);
+            assert_eq!(changed_tables(&layout, &out), vec![128 * MIB, 256 * MIB]);
+            let mut expected = vec![128 * MIB, to - MIB];
+            expected.sort_unstable();
+            assert_eq!(changed_tables(&out, &after), expected);
+            let last = after.entries().into_iter().max_by_key(|e| e.index).unwrap();
+            assert_eq!(last.offset, to, "still the last in the chain");
+        }
+    }
+
+    #[test]
+    fn rollback_puts_the_chain_back_exactly() {
+        let layout = three_logicals();
+        for from in [72 * MIB, 129 * MIB, 257 * MIB] {
+            let key = Layout::logical_key(from, 400 * MIB).unwrap();
+            let entry = layout.find(key).unwrap();
+            let snapshot = layout.snapshot(&entry).unwrap();
+            let mut l = layout.clone();
+            l.remove(&entry);
+            l.insert(key, &snapshot, from, 512).unwrap();
+            assert_eq!(shape(&l), shape(&layout), "from {from}");
+            assert!(changed_tables(&layout, &l).is_empty());
+        }
+    }
+
+    #[test]
+    fn logical_drive_only_moves_into_free_room_inside_its_container() {
+        let layout = three_logicals();
+        for (from, to, why) in [
+            (129 * MIB, 230 * MIB, "runs into the next EBR"),
+            (72 * MIB, 64 * MIB, "over the EBR at the container start"),
+            (
+                72 * MIB,
+                120 * MIB,
+                "the first logical runs into the next EBR",
+            ),
+            (257 * MIB, 150 * MIB, "its EBR would land inside L2"),
+            (
+                257 * MIB,
+                161 * MIB,
+                "its EBR would be the last sector of L2",
+            ),
+            (
+                257 * MIB,
+                520 * MIB,
+                "past the end of the extended partition",
+            ),
+            (129 * MIB, 32 * MIB, "outside the extended partition"),
+        ] {
+            assert!(
+                move_logical(&layout, from, to).is_err(),
+                "{from} -> {to}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_insert_changes_nothing() {
+        let layout = three_logicals();
+        let key = Layout::logical_key(129 * MIB, 230 * MIB).unwrap();
+        let entry = layout.find(key).unwrap();
+        let snapshot = layout.snapshot(&entry).unwrap();
+        let mut out = layout.clone();
+        out.remove(&entry);
+        let before = out.raw.clone();
+        assert_eq!(
+            out.insert(key, &snapshot, 230 * MIB, 512),
+            Err(IoError::Os(183))
+        );
+        assert_eq!(out.raw, before);
+        assert_eq!(
+            out.insert(key, &snapshot, 300 * MIB, 512),
+            Err(INVALID),
+            "neither the key's source nor its target"
+        );
+    }
+
+    #[test]
+    fn logical_key_names_both_places() {
+        let layout = three_logicals();
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        assert_eq!(Layout::logical_ends(key), Some((129 * MIB, 200 * MIB)));
+        let l2 = layout.find(key).unwrap();
+        assert_eq!(l2.offset, 129 * MIB);
+        assert_eq!(layout.key_of(&l2), None, "logical drives have no fixed key");
+        assert!(Layout::logical_key(513, 0).is_none());
+        assert!(Layout::logical_key(0, 512 << 48).is_none());
+        let records = snapshot_records(&layout.snapshot(&l2).unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            (records[0].offset, records[0].mbr_type),
+            (129 * MIB, Some(0x07))
+        );
+        assert_eq!(
+            (records[1].offset, records[1].mbr_type),
+            (128 * MIB, Some(0x05))
+        );
+    }
+
+    #[test]
+    fn snapshots_only_go_back_with_their_own_kind_of_key() {
+        let layout = three_logicals();
+        let extended = layout.entries().into_iter().find(|e| e.index == 1).unwrap();
+        let whole = layout.snapshot(&extended).unwrap();
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        let l2 = layout.find(key).unwrap();
+        let single = layout.snapshot(&l2).unwrap();
+        let mut out = layout.clone();
+        out.remove(&l2);
+        assert_eq!(out.insert(key, &whole, 200 * MIB, 512), Err(INVALID));
+        let container_key = layout.key_of(&extended).unwrap();
+        let mut gone = layout.clone();
+        gone.remove(&extended);
+        assert_eq!(
+            gone.insert(container_key, &single, 64 * MIB, 512),
+            Err(INVALID)
+        );
+    }
+
+    #[test]
+    fn free_check_for_a_logical_drive_ignores_only_its_container() {
+        let layout = three_logicals();
+        let primary = layout.key_of(&layout.entries()[0]).unwrap();
+        assert!(
+            !layout.range_is_free_for(primary, 200 * MIB, MIB),
+            "inside the container"
+        );
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        assert!(layout.range_is_free_for(key, 200 * MIB, MIB));
+        assert!(
+            !layout.range_is_free_for(key, 64 * MIB, MIB),
+            "the first EBR"
+        );
+        assert!(!layout.range_is_free_for(key, 128 * MIB, 512), "an EBR");
+        assert!(!layout.range_is_free_for(key, 600 * MIB, MIB), "outside");
+    }
+
+    #[test]
+    fn chain_ends_at_a_table_without_a_boot_signature() {
+        let layout = three_logicals();
+        let mut sectors: std::collections::HashMap<u64, Vec<u8>> =
+            layout.table_sectors(512).into_iter().collect();
+        sectors.get_mut(&(256 * MIB)).unwrap()[511] = 0;
+        let read = Layout::read_mbr(512, |at| {
+            Ok(sectors.get(&at).cloned().unwrap_or_else(|| vec![0; 512]))
+        })
+        .unwrap();
+        assert_eq!(
+            logicals(&read),
+            vec![(72 * MIB, 24 * MIB), (129 * MIB, 32 * MIB)],
+            "L3 drops out, as on Windows"
+        );
+    }
 }
