@@ -78,7 +78,7 @@ public static class Classifier
                 break;
             case PartitionRole.Extended:
                 issues.Add(new("partition.extended", IssueSeverity.Blocker,
-                    "MBR extended partition (a container for logical drives). Not supported.", OperationKind.All));
+                    "MBR extended partition (a container for logical drives). It can be moved together with every logical drive in it, or grown into free space after it so its last logical drive can be extended.", OperationKind.All & ~(OperationKind.Move | OperationKind.Extend)));
                 break;
             case PartitionRole.MoveInProgress:
                 issues.Add(new("partition.move-in-progress", IssueSeverity.Blocker,
@@ -101,7 +101,7 @@ public static class Classifier
         if (p.IsLogical)
         {
             issues.Add(new("partition.logical", IssueSeverity.Blocker,
-                "Logical drive inside an MBR extended partition. Moving logical drives is not supported.", OperationKind.Move));
+                "Logical drive inside an MBR extended partition. It can't be moved on its own; move the extended partition that holds it. It can be extended into free space inside the extended partition.", OperationKind.Move));
         }
         if (p.IsSystem && p.Role != PartitionRole.EfiSystem)
         {

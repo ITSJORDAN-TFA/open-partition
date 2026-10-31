@@ -5,7 +5,14 @@
     <UseWPF>true</UseWPF>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>OpenPartition</AssemblyName>
+    <ApplicationIcon>Assets\OpenPartition.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\OpenPartition.ico" />
+    <Resource Include="Assets\AppIcon-64.png" />
+    <Resource Include="Assets\AppIcon-256.png" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../OpenPartition.Model/OpenPartition.Model.csproj" />

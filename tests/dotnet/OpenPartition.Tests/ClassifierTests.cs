@@ -50,7 +50,6 @@ public class ClassifierTests
     [InlineData(PartitionRole.EfiSystem, "partition.efi")]
     [InlineData(PartitionRole.MicrosoftReserved, "partition.msr")]
     [InlineData(PartitionRole.Recovery, "partition.recovery")]
-    [InlineData(PartitionRole.Extended, "partition.extended")]
     [InlineData(PartitionRole.Unknown, "partition.unknown-type")]
     [InlineData(PartitionRole.MoveInProgress, "partition.move-in-progress")]
     public void SpecialPartitionsBlockEveryOperation(PartitionRole role, string code)
@@ -60,6 +59,25 @@ public class ClassifierTests
         {
             Assert.True(Blocks(issues, code, op), $"{code} should block {op}");
         }
+    }
+
+    [Fact]
+    public void ExtendedPartitionCanOnlyBeMovedAsAWhole()
+    {
+        var issues = Classifier.ForPartition(Data() with { Role = PartitionRole.Extended });
+        Assert.DoesNotContain(issues, i => i.BlocksOperation(OperationKind.Move) || i.BlocksOperation(OperationKind.Extend));
+        foreach (var op in new[] { OperationKind.Delete, OperationKind.Shrink, OperationKind.Format })
+        {
+            Assert.True(Blocks(issues, "partition.extended", op), op.ToString());
+        }
+    }
+
+    [Fact]
+    public void LogicalDriveCannotBeMovedOnItsOwnButCanBeExtended()
+    {
+        var issues = Classifier.ForPartition(Data(Volume()) with { IsLogical = true });
+        Assert.True(Blocks(issues, "partition.logical", OperationKind.Move));
+        Assert.False(Blocks(issues, "partition.logical", OperationKind.Extend));
     }
 
     [Fact]
