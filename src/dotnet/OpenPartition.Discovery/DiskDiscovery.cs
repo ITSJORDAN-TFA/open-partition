@@ -28,7 +28,7 @@ public static class DiskDiscovery
         var volumes = VolumeProbe.Enumerate(notes);
         var pageFiles = VolumeUsageProbe.PageFileVolumes(volumes, notes);
         var hibernation = VolumeUsageProbe.HibernationVolumes(volumes);
-        var (shadowCopies, shadowStorage) = VolumeUsageProbe.ShadowCopies(notes);
+        var (shadowCopies, shadowStorage, associations) = VolumeUsageProbe.ShadowCopies(notes);
         var bitLocker = VolumeUsageProbe.BitLocker(volumes, elevated, notes);
         var bootVolume = VolumeProbe.VolumeOf(System.Environment.SystemDirectory);
 
@@ -48,6 +48,7 @@ public static class DiskDiscovery
                 BitLockerDetail = bl.Detail,
                 HasPageFile = pageFiles.Contains(v.Path),
                 HasHibernationFile = hibernation.Contains(v.Path),
+                ShadowStorage = associations.Where(a => a.SourceVolume.Equals(v.Path, StringComparison.OrdinalIgnoreCase) || a.StorageVolume.Equals(v.Path, StringComparison.OrdinalIgnoreCase)).ToArray(),
                 HasShadowCopies = shadowCopies.Contains(v.Path),
                 HostsShadowStorage = shadowStorage.Contains(v.Path),
                 IsSpanned = v.Extents.Count > 1,

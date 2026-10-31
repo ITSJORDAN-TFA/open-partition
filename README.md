@@ -187,3 +187,11 @@ package. It builds throwaway VHDX disks, moves partitions on them, and deletes t
 ## Contributing
 
 Issues, compatibility reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: this tool writes raw disk sectors, so changes to how it writes need crash-campaign and VHDX tests. Report security problems privately ([SECURITY.md](SECURITY.md)). Everyone follows the [code of conduct](CODE_OF_CONDUCT.md).
+
+Shadow-copy refusal: use `opm shadows <disk> <which>` or **Shadow copies...** in the GUI
+to inspect source/storage volume GUID paths. Deletion permanently loses previous versions
+and restore points and requires typing the source GUID path (`--delete --yes
+--confirm-volume <path>` in CLI). Automatic deletion is limited to file-backed test disks.
+Backup-managed copies and remaining storage associations require the backup administrator;
+refresh discovery before replanning. Snapshot-preserving relocation is unsupported because
+changing shadow storage can discard snapshots.
