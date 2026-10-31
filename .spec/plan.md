@@ -43,17 +43,60 @@ Windows 11 (GPT volume GUID survives the remove and re-add). **Confirmed on Serv
 table, files identical, scan clean, volume GUID kept. Still to do: the GUI/CLI must read the journal and mark the range, because during an interrupted move
 it shows as free space in Disk Management; README warning.
 
-### Field finding: the boxed-in C: on MBR with logical drives
+### Field finding: the boxed-in C: on MBR with logical drives (engine support done, VHDX)
 
 The test VM is the real-world case: C: (51.5 GB, 71% used) is followed by a primary (I:) and an
 **extended partition holding three logical drives** (E:, L:, K:), with 129 GB free at the end of
-the disk. Extending C: means moving I: *and the whole extended container* right. v1 refuses
-logical-drive moves, so the planner can't solve this yet. Proposed: move the extended container
-as one block. EBR link offsets are relative to the container start and each logical drive is
-relative to its own EBR, so a whole-container block copy keeps the internal chain valid, and
-only the primary table's extended entry changes. Every logical volume's absolute offset still
-changes, so the MBR `MountedDevices` fix-up (G1) is needed for each of them. Add to Phase 4 and
-test on the Gen 1 Hyper-V VM first.
+the disk. Extending C: means moving I: *and the whole extended container* right.
+
+Done (2026-10-30, journal format 3):
+- **Whole-container moves.** `opm-engine move --from <extended start>` moves the extended
+  partition with every logical drive in it as one block. Logical offsets inside the container
+  are relative, so the block copy keeps the chain valid. The journaled snapshot holds the
+  extended entry plus every logical and link entry (up to 11 logical drives). They are removed
+  from the table together and put back shifted; Windows rewrites the EBRs from the layout.
+  Logical drives still can't be moved on their own. Every volume inside the range is locked
+  first.
+- **G1, MBR identity.** Windows names a basic MBR volume by disk signature + start. Drive
+  letters live in `HKLM\SYSTEM\MountedDevices` and are rewritten to the new start before the
+  entries go back. Volume GUIDs are usually *computed* from signature + start, with no stored
+  entry (seen on Windows 11 and on the Azure VM, including C:), so a
+  `\??\Volume{old computed GUID}` value pointing at the new start is added. The mount manager
+  uses it and the volume keeps its GUID. The rewrite plan is saved under
+  `HKLM\SOFTWARE\OpenPartition` first, so a crash part way through replays it exactly.
+- Verified on VHDX: harness layout `mbr-512n-logical-boxed-in`. Move the extended partition,
+  then the primary, then `Resize-Partition` SYS into the freed space; files identical, scans
+  clean, all volume GUIDs kept, including a run killed mid-copy and recovered. The packaged
+  self-test has the same round.
+- **Confirmed on Server 2016** (Azure field test #6): the same round on a VHDX on the VM passed:
+  the extended partition with 3 logical drives (all 3 volumes locked) and the primary moved
+  256 MiB, the first partition extended, files identical, scans clean, volume GUIDs **and drive
+  letters** kept, in 14.7 s.
+- Drive letters are only checked where no Remote Desktop client runs: `msrdc.exe` (RDP drive
+  redirection) opens every new lettered volume and never lets go, so the engine correctly
+  refuses to lock it. Real servers will have similar holders (services, agents, open
+  files): a live move of a busy volume needs the owner stopped, or the boot-time mode.
+
+### Operations in the GUI and CLI (2026-10-31)
+
+General operations, not a single-purpose wizard: **Move** (any movable partition, or an MBR
+extended partition with its logical drives, anywhere in the free space around it) and
+**Extend** (Windows' own `MSFT_Partition.Resize` into free space after a volume). The GUI
+queues them, previews the resulting layout on the disk map, and applies them in order; `opm
+move | extend | resume` do the same one step at a time (dry run unless `--yes`).
+`OpenPartition.Operations` holds the planner (pure), the write gate, the engine runner (one
+journal per move in %ProgramData%\OpenPartition\journals) and the resizer; GUI and CLI share it.
+
+**Write gate (option A, user decision):** test VHD/VHDX disks always; real disks only on an
+Azure VM after the user names a snapshot. The engine enforces it itself
+(`--snapshot-confirmed` + SMBIOS asset tag read via `GetSystemFirmwareTable`); the .NET side
+applies the same rule, including to extends. Physical machines, Hyper-V and other hypervisors
+stay read-only for now. Compatibility matrix in the README.
+
+Verified: planner unit tests on the Azure layout; `opm` end to end on VHDX (free space after
+SYS by moving the extended partition and PRIM, extend SYS), including an engine kill and `opm
+resume`; the GUI driven by UI Automation through the same flow
+(`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
 ---
 
@@ -223,3 +266,37 @@ Each spike ends with a short write-up in `/docs/research/`.
 1. ~~Confirm D1–D3 (and D6).~~ Done.
 2. Phase 0: repo scaffold, `build.ps1`, CI, harness skeleton, sim disk.
 3. Start spikes S1 and S2 straight away. They decide the rest of the architecture.
+
+## v0.1.0 baseline (2026-10-31)
+
+Shipped since the "Operations in the GUI and CLI" section above:
+
+- **Field incident (Azure, Server 2016):** moving the 65 GB extended partition finished the
+  copy but failed the final source-digest check, so the partition stayed out of the table
+  (by design). `compare` and `rollback` were added; rollback put E:, K: and the other logical
+  drives back with their letters. Root cause not proven (the source changed between hashing
+  and copying).
+- **Engine (journal format 4):**
+  - The source is hashed only after the entry is out of the table.
+  - Each chunk is checked against its own digest as it is copied, so a source change stops the
+    move at that chunk (`SourceChanged`). A non-overlapping move that fails verification
+    undoes itself (`rolled_back=yes`).
+  - The final full re-read only runs after a restart.
+  - `roll_back` (core), `rollback` / `compare` (CLI), `opm undo`, and Undo in the GUI.
+- **Speed:**
+  - Copy maps (only mapped parts are hashed and copied; the map file sits next to the journal,
+    identified by SHA-256).
+  - Parallel unbuffered I/O through 4 handles in 8 MiB pieces.
+  - Multi-core tree SHA-256.
+  - Chunks up to 128 MiB.
+- **Known gap G11:** NTFS free-space skipping is not effective yet. `FSCTL_GET_NTFS_VOLUME_DATA`
+  on the locked volume fails with ERROR_NOT_READY (0x15) on Server 2016, so whole volumes are
+  copied (safe fallback, logged per volume as `free_bytes=unknown`). Reading the bitmap before
+  the lock is unsafe (allocations in between would be skipped). Next: find a lock-safe way, e.g.
+  parse `$Bitmap` through the locked handle.
+- **GUI:**
+  - New look (sidebar, summary cards, tile map, partition table, details pane, footer Apply).
+  - Icons (`assets/brand`).
+  - Drag-to-place Move/Extend dialogs with exact MiB fields and a whole-disk strip.
+- **Releases:** CI publishes `openpartition-<version>-win-x64.zip` to GitHub Releases (tags
+  `v*`), and a rolling `preview` pre-release from `main`.
