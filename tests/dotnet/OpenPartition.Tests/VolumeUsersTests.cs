@@ -82,8 +82,11 @@ public class VolumeUsersTests
         Assert.Contains("Resource Monitor (CPU tab, Associated Handles, search \"E:\\\")", message, StringComparison.Ordinal);
 
         var partial = VolumeUsers.Format(Diagnosis(true, new VolumeUser(5, "a.exe", null, [], [@"E:\f"])), StopHint.Command);
-        Assert.Contains("this list may be incomplete", partial, StringComparison.Ordinal);
+        Assert.Contains("This list may be incomplete: not every program could be checked", partial, StringComparison.Ordinal);
         Assert.Contains("Resource Monitor", partial, StringComparison.Ordinal);
+
+        var named = VolumeUsers.Format(Diagnosis(true, new VolumeUser(5, "a.exe", null, [], [@"E:\f"])) with { Unchecked = ["busy.exe (process 77)"] }, StopHint.Command);
+        Assert.Contains("This list may be incomplete: some open files of busy.exe (process 77) could not be checked", named, StringComparison.Ordinal);
     }
 
     [Fact]
