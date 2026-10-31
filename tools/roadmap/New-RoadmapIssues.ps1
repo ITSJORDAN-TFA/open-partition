@@ -99,7 +99,7 @@ foreach ($title in ($sections | ForEach-Object Milestone | Select-Object -Unique
 "Milestones ready."
 
 $existing = @{}
-foreach ($i in (Invoke-Gh issue list --state all --limit 500 --json number,title | ConvertFrom-Json)) { $existing[$i.title] = $i.number }
+foreach ($i in (Invoke-Gh issue list --state all --limit 500 --json 'number,title' | ConvertFrom-Json)) { $existing[$i.title] = $i.number }
 
 function Format-Body($s, $numbers) {
     $body = $s.Body.ToString().Trim()
