@@ -314,10 +314,21 @@ internal static class Dialogs
                 {
                     await Engine.RecoverAsync(pending.Move, disk.Number, name, progress);
                 }
-                bar.IsIndeterminate = false;
-                bar.Value = 1;
-                status.Text = undo ? "Undone: the partition is back where it was. Refresh to see it." : "The move is finished.";
-                status.Foreground = Palette.Planned;
+                var done = undo ? "Undone: the partition is back where it was. Refresh to see it." : "The move is finished.";
+                try
+                {
+                    await WinReHook.Default.FinishAfterRecoveryAsync(pending.Move, disk.Number, undo, progress);
+                    bar.IsIndeterminate = false;
+                    bar.Value = 1;
+                    status.Text = done;
+                    status.Foreground = Palette.Planned;
+                }
+                catch (OperationFailedException e)
+                {
+                    bar.IsIndeterminate = false;
+                    status.Text = $"{done} {e.Message}";
+                    status.Foreground = Palette.Blocker;
+                }
             }
             catch (OperationFailedException e)
             {

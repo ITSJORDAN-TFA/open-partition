@@ -31,6 +31,7 @@ public static class DiskDiscovery
         var (shadowCopies, shadowStorage) = VolumeUsageProbe.ShadowCopies(notes);
         var bitLocker = VolumeUsageProbe.BitLocker(volumes, elevated, notes);
         var bootVolume = VolumeProbe.VolumeOf(System.Environment.SystemDirectory);
+        var winRe = WinReProbe.Read();
 
         var volumeInfos = volumes.ToDictionary(v => v.Path, v =>
         {
@@ -85,7 +86,7 @@ public static class DiskDiscovery
         var disks = new List<DiskInfo>();
         foreach (var number in diskNumbers)
         {
-            var disk = DescribeDisk(number, diskRows.GetValueOrDefault(number), partitionFlags, volumeByExtent, bootVolume, notes, probing: diskRows.Count == 0);
+            var disk = DescribeDisk(number, diskRows.GetValueOrDefault(number), partitionFlags, volumeByExtent, bootVolume, winRe, notes, probing: diskRows.Count == 0);
             if (disk is not null)
             {
                 disks.Add(disk);
@@ -103,6 +104,7 @@ public static class DiskDiscovery
             IsElevated = elevated,
             Environment = environment,
             Azure = azure,
+            WinRe = winRe,
             Disks = disks,
             Issues = issues,
         };
@@ -114,6 +116,7 @@ public static class DiskDiscovery
         Dictionary<(int, long), (bool Boot, bool System)> partitionFlags,
         Dictionary<(int, long), VolumeInfo> volumeByExtent,
         string? bootVolume,
+        WinReInfo winRe,
         List<string> notes,
         bool probing)
     {
@@ -159,9 +162,10 @@ public static class DiskDiscovery
                 IsLogical = isLogical,
                 IsBoot = flags.Boot || (volume is not null && string.Equals(volume.Path, bootVolume, StringComparison.OrdinalIgnoreCase)),
                 IsSystem = flags.System || role == PartitionRole.EfiSystem && wmi is null,
+                HostsWinRe = winRe.Location is { } re && re.DiskNumber == number && re.PartitionNumber == raw.Number,
                 Volume = volume,
             };
-            partitions.Add(partition with { Issues = Classifier.ForPartition(partition) });
+            partitions.Add(partition with { Issues = Classifier.ForPartition(partition, winRe, number) });
         }
 
         var (usableStart, usableEnd) = layout.Style == PartitionStyle.Gpt && layout.GptStartingUsableOffset is { } start && layout.GptUsableLength is { } length
@@ -192,6 +196,17 @@ public static class DiskDiscovery
             FreeExtents = layout.Style is PartitionStyle.Gpt or PartitionStyle.Mbr ? FreeSpace.Compute(usableStart, usableEnd, partitions) : [],
         };
         return disk with { Issues = Classifier.ForDisk(disk) };
+    }
+
+    /// <summary>
+    /// The partition number Windows gives the partition starting at <paramref name="offset"/>
+    /// on disk <paramref name="diskNumber"/>, read from the partition table; null if none starts there.
+    /// </summary>
+    public static int? PartitionNumberAt(int diskNumber, long offset)
+    {
+        using var handle = DeviceHandle.OpenForQuery($@"\\.\PhysicalDrive{diskNumber}");
+        var layout = LayoutParser.ParseLayout(DeviceHandle.Query(handle, IoctlCodes.DiskGetDriveLayoutEx, 64 * 1024));
+        return layout.Partitions.FirstOrDefault(p => p.Offset == offset && p.Number > 0)?.Number;
     }
 
     /// <summary>MSFT_Disk.BusType values.</summary>

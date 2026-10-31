@@ -113,7 +113,8 @@ the engine itself, not just the GUI.
 | 512-byte and 4K-native sectors (512n, 512e, 4Kn) | ✅ | 🟡 | |
 | Partition followed by free space (e.g. C:) | | ✅ | Uses Windows' own resize, which is safe on a running system |
 | Windows (boot) partition, C: | ⛔ | 🟡 | Can't be moved while Windows runs; it can be extended |
-| System / EFI / MSR / recovery partitions | ⛔ | ⛔ | Never changed |
+| Windows Recovery partition (e.g. right after C:) | 🚧 | ⛔ | Move only. WinRE is turned off before the move (`reagentc /disable`), back on after it (`reagentc /enable`) and checked with `reagentc /info`. Refused when WinRE's state can't be read (including non-English `reagentc` output) or the partition holds the system reset image. Not tested yet: the VHDX tests (`gpt-512e-recovery-after-c`) and the VM test for WinRE (`tests/harness/Test-WinReAfterMove.ps1`) are written but haven't been run |
+| System / EFI / MSR partitions | ⛔ | ⛔ | Never changed |
 | Volume with a page file or hibernation file | ⛔ | 🟡 | Move the page file elsewhere first |
 | BitLocker-encrypted volume | ⛔ | 🟡 | Decrypt before moving |
 | Volume in use (open files, services) | ⛔ until released | ✅ | Never forced closed; stop whatever uses it. Remote Desktop drive redirection on the machine running the tool holds new drive letters open |

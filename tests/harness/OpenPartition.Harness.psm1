@@ -65,7 +65,10 @@ function Test-LayoutDefinition {
     if ($Layout.Style -eq 'MBR' -and @($kinds | Where-Object { $_ -ne 'Logical' }).Count -gt 4) {
         $problems.Add('MBR layouts are limited to 4 primary partitions')
     }
-    if ($Layout.Style -ne 'MBR' -and @($kinds | Where-Object { $_ -ne 'Primary' }).Count) {
+    if (@($kinds | Where-Object { $_ -notin 'Primary', 'Recovery', 'Extended', 'Logical' }).Count) {
+        $problems.Add("unknown Kind (use Primary, Recovery, Extended or Logical)")
+    }
+    if ($Layout.Style -ne 'MBR' -and @($kinds | Where-Object { $_ -notin 'Primary', 'Recovery' }).Count) {
         $problems.Add('extended and logical partitions need an MBR layout')
     }
     $extendedEnd = $null
@@ -224,6 +227,28 @@ function Test-DeterministicData {
     return $problems
 }
 
+function Set-RecoveryPartitionType {
+    <# Turns a partition on a harness VHDX into a Windows Recovery partition. #>
+    param([int] $DiskNumber, [int] $PartitionNumber, [string] $Style)
+    $disk = Get-Disk -Number $DiskNumber
+    if ($disk.BusType -ne 'File Backed Virtual') { throw "Disk $DiskNumber is not a VHD/VHDX; refusing to change it." }
+    $script = if ($Style -eq 'GPT') {
+        "select disk $DiskNumber`nselect partition $PartitionNumber`nset id=de94bba4-06d1-4d40-a16a-bfd50179d6ac override`ngpt attributes=0x8000000000000001"
+    }
+    else {
+        "select disk $DiskNumber`nselect partition $PartitionNumber`nset id=27 override"
+    }
+    $file = New-TemporaryFile
+    try {
+        Set-Content -Path $file -Value $script -Encoding ascii
+        $output = diskpart.exe /s $file
+        if ($LASTEXITCODE) { throw "diskpart could not set the recovery type: $($output -join ' ')" }
+    }
+    finally {
+        Remove-Item $file -ErrorAction SilentlyContinue
+    }
+}
+
 function New-TestDisk {
     <#
         Creates a VHDX from a catalogue layout, fills it with deterministic data and writes
@@ -247,6 +272,7 @@ function New-TestDisk {
 
     $mountRoot = Join-Path ([System.IO.Path]::GetTempPath()) "opm-harness-$([guid]::NewGuid())"
     $dataSets = [System.Collections.Generic.List[object]]::new()
+    $recoveries = [System.Collections.Generic.List[int]]::new()
     $vhd = Mount-VHD -Path $Path -NoDriveLetter -Passthru
     try {
         $diskNumber = $vhd.DiskNumber
@@ -275,6 +301,7 @@ function New-TestDisk {
             # becomes the next logical drive inside it.
             $partition = New-Partition @newPartition
             $partition | Format-Volume -FileSystem $p.FileSystem -NewFileSystemLabel $p.Label -Confirm:$false | Out-Null
+            if ($kind -eq 'Recovery') { $recoveries.Add($partition.PartitionNumber) }
 
             if ($p.FillPercent -gt 0) {
                 $mount = Join-Path $mountRoot $index
@@ -291,6 +318,11 @@ function New-TestDisk {
                 }
             }
             $index++
+        }
+        # Recovery type last, after the data is written (as Windows Setup leaves it: GPT type
+        # de94bba4 with "no drive letter" + "required"; MBR type 0x27).
+        foreach ($number in $recoveries) {
+            Set-RecoveryPartitionType -DiskNumber $diskNumber -PartitionNumber $number -Style $definition.Style
         }
     }
     finally {

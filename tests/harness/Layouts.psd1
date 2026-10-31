@@ -6,6 +6,9 @@
 # deterministic test data is written to the volume. On MBR, Kind = 'Extended' makes an
 # extended partition (no file system) and Kind = 'Logical' a logical drive inside the extended
 # partition before it; Windows puts 64 KiB of chain overhead before each logical drive.
+# Kind = 'Recovery' (GPT or MBR) makes a Windows Recovery partition: it is formatted and filled
+# like a primary, then given the recovery type (GPT de94bba4 with attributes
+# 0x8000000000000001, MBR 0x27). It holds no real WinRE; see tests/harness/Test-WinReAfterMove.ps1.
 # Keep at least ~40 MiB free on small volumes: Repair-Volume -Scan needs room for a snapshot.
 #
 # Kept small on purpose: every integration run builds, fills, moves and re-reads these, and
@@ -100,6 +103,17 @@
             @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG1'; FillPercent = 45 }
             @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG2'; FillPercent = 40 }
             @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG3'; FillPercent = 45 }
+        )
+    }
+
+    'gpt-512e-recovery-after-c' = @{
+        Description  = 'C: boxed in by recovery: the common Gen2 / Azure OS disk after it was grown. The Recovery partition sits right after OS, the new space after it; moving Recovery to the end lets OS grow.'
+        Style        = 'GPT'
+        SectorFormat = '512e'
+        DiskSizeMB   = 1024
+        Partitions   = @(
+            @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'OS'; FillPercent = 60 }
+            @{ Kind = 'Recovery'; SizeMB = 128; FileSystem = 'NTFS'; Label = 'RECOVERY'; FillPercent = 40 }
         )
     }
 }

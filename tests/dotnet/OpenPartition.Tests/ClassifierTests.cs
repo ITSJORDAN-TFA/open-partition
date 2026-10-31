@@ -49,7 +49,6 @@ public class ClassifierTests
     [Theory]
     [InlineData(PartitionRole.EfiSystem, "partition.efi")]
     [InlineData(PartitionRole.MicrosoftReserved, "partition.msr")]
-    [InlineData(PartitionRole.Recovery, "partition.recovery")]
     [InlineData(PartitionRole.Unknown, "partition.unknown-type")]
     [InlineData(PartitionRole.MoveInProgress, "partition.move-in-progress")]
     public void SpecialPartitionsBlockEveryOperation(PartitionRole role, string code)
@@ -59,6 +58,70 @@ public class ClassifierTests
         {
             Assert.True(Blocks(issues, code, op), $"{code} should block {op}");
         }
+    }
+
+    private static readonly WinReInfo WinReOnPartition2 = new()
+    {
+        Status = WinReStatus.Enabled,
+        Location = new WinReLocation(1, 2, @"\\?\GLOBALROOT\device\harddisk1\partition2\Recovery\WindowsRE"),
+    };
+
+    private static PartitionInfo Recovery(bool hostsWinRe = true) => Data(Volume()) with
+    {
+        Role = PartitionRole.Recovery,
+        GptType = GptTypes.Recovery,
+        // As Windows Setup creates it: no drive letter + required by the platform.
+        GptAttributes = 0x8000_0000_0000_0001,
+        HostsWinRe = hostsWinRe,
+    };
+
+    [Fact]
+    public void RecoveryPartitionCanOnlyBeMoved()
+    {
+        var issues = Classifier.ForPartition(Recovery(), WinReOnPartition2, 1);
+        Assert.DoesNotContain(issues, i => i.BlocksOperation(OperationKind.Move));
+        foreach (var op in new[] { OperationKind.Delete, OperationKind.Extend, OperationKind.Shrink, OperationKind.Format })
+        {
+            Assert.True(Blocks(issues, "partition.recovery", op), op.ToString());
+        }
+        Assert.Contains(issues, i => i.Code == "partition.recovery-winre" && i.Severity == IssueSeverity.Info);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RecoveryPartitionCannotMoveWhileWinReStateIsUnknown(bool probed)
+    {
+        var winRe = probed ? WinReInfo.Unknown("reagentc /info failed with exit code 2") : null;
+        var issues = Classifier.ForPartition(Recovery(), winRe, 1);
+        Assert.True(Blocks(issues, "partition.recovery-winre-unknown", OperationKind.Move));
+        Assert.Contains(issues, i => i.Message.Contains("reagentc /info", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RecoveryPartitionWithoutWinReMovesWithoutReRegistering()
+    {
+        var disabled = new WinReInfo { Status = WinReStatus.Disabled };
+        var issues = Classifier.ForPartition(Recovery(hostsWinRe: false), disabled, 1);
+        Assert.DoesNotContain(issues, i => i.BlocksOperation(OperationKind.Move));
+        Assert.Contains(issues, i => i.Code == "partition.recovery-unused" && i.Message.Contains("disabled", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RecoveryPartitionHoldingTheResetImageStaysPut()
+    {
+        var winRe = WinReOnPartition2 with { ResetImage = new WinReLocation(1, 2, @"\\?\GLOBALROOT\device\harddisk1\partition2\RecoveryImage") };
+        Assert.True(Blocks(Classifier.ForPartition(Recovery(), winRe, 1), "partition.recovery-reset-image", OperationKind.Move));
+        // The same partition number on another disk is a different partition.
+        Assert.DoesNotContain(Classifier.ForPartition(Recovery(hostsWinRe: false), winRe, 0), i => i.BlocksOperation(OperationKind.Move));
+    }
+
+    [Fact]
+    public void WinReOnADataPartitionBlocksItsMove()
+    {
+        var issues = Classifier.ForPartition(Data(Volume()) with { HostsWinRe = true }, WinReOnPartition2, 1);
+        Assert.True(Blocks(issues, "partition.winre", OperationKind.Move));
+        Assert.False(Blocks(issues, "partition.winre", OperationKind.Extend));
     }
 
     [Fact]

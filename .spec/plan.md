@@ -98,6 +98,48 @@ SYS by moving the extended partition and PRIM, extend SYS), including an engine 
 resume`; the GUI driven by UI Automation through the same flow
 (`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
+### Moving the Windows Recovery partition (issue #11, 2026-10-31)
+
+The classifier now allows **Move** (only Move) for a Recovery partition, when WinRE can be
+re-registered afterwards. Discovery runs `reagentc /info` (read-only; a source test keeps
+discovery from running any other reagentc command) and marks the partition WinRE is staged on
+(`PartitionInfo.HostsWinRe`, matched by `harddiskN\partitionM`).
+
+- **Decision: `reagentc /disable` before the move, `/enable` after**, not patching the BCD
+  `recoverysequence` / ramdisk device afterwards. ReAgent.xml locates winre.wim by disk and
+  partition offset, the WinRE BCD entry's ramdisk device is a partition element (an offset on
+  MBR), and the partition's number can change when the engine takes its entry out of the table
+  and puts it back. Disabling first is Microsoft's own procedure for relocating the recovery
+  partition (KB5028997): winre.wim moves to `C:\Windows\System32\Recovery` and the BCD entry
+  is removed while everything is still consistent; `/enable` stages it again and writes a fresh
+  entry. The hook (`WinReHook`, run by `Executor` so GUI and CLI both get it) checks before the
+  move that WinRE is still where the plan saw it, checks after `/disable` that it is Disabled and
+  the image is on C:, and after `/enable` that `reagentc /info` shows Enabled on the partition
+  now at the target. A failed move with the partition back in the table (rolled back) turns
+  WinRE back on where it was; an interrupted one leaves a marker
+  (`journals\winre-pending.json`) and `opm resume` / GUI Resume or Undo turn WinRE on after
+  finishing. Every failure message says whether data changed and gives the reagentc steps.
+- **Refused:** WinRE state unknown (reagentc failed, not elevated, or **non-English output**:
+  the labels are translated and are not guessed at; a known gap); the partition holds the
+  system reset image (`Recovery image location`); WinRE on a non-Recovery partition; WinRE on a
+  logical drive inside an extended partition that would move.
+- GPT recovery partitions carry the "required" attribute (`0x8000000000000001`); it no longer
+  blocks Move for the Recovery role, since the engine restores the entry's attributes. Every
+  other operation on a Recovery partition stays blocked.
+- **Untested gap:** whether `reagentc /enable` always picks the moved recovery partition (it
+  did in Microsoft's procedure with a newly created one). If it stages WinRE elsewhere (C:),
+  the step fails with the `/setreimage` steps to put it back.
+- **Testing:** xUnit (parser on real output, classifier, planner on "C: boxed in by recovery",
+  hook against a scripted reagentc). Harness: `Kind = 'Recovery'` in layouts, layout
+  `gpt-512e-recovery-after-c`, VHDX tests `Test-MoveRecoveryPartitionAfterC` and
+  `Test-OpmMovesRecoveryThenExtendsOs`. **The write gate refuses real disks in a Hyper-V
+  guest**, so the VM test (`tests/harness/Test-WinReAfterMove.ps1`) moves the guest's recovery
+  partition offline on the host (the guest's VHDX mounted = file-backed, allowed) and runs
+  reagentc only in the guest, then boots into WinRE with `/boottore`. It tests the WinRE
+  procedure, not the in-guest `WinReHook` path; that needs either a real-disk Azure round or a
+  decision to let the gate allow Hyper-V guests with a checkpoint. MBR moved offline on the host
+  don't rewrite the guest's MountedDevices (the recovery volume has no letter).
+
 ---
 
 ## 1. Decisions to make now

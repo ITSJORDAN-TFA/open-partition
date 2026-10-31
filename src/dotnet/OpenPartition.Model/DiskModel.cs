@@ -89,6 +89,8 @@ public sealed record PartitionInfo
     public bool IsBoot { get; init; }
     /// <summary>Holds the boot manager (EFI System partition or active MBR partition).</summary>
     public bool IsSystem { get; init; }
+    /// <summary>The running Windows' recovery environment (winre.wim) is staged on this partition.</summary>
+    public bool HostsWinRe { get; init; }
     public VolumeInfo? Volume { get; init; }
     public IReadOnlyList<Issue> Issues { get; init; } = [];
 
@@ -139,6 +141,8 @@ public sealed record SystemSnapshot
     public required bool IsElevated { get; init; }
     public HostEnvironment Environment { get; init; }
     public AzureInfo? Azure { get; init; }
+    /// <summary>The running Windows' recovery environment (<c>reagentc /info</c>).</summary>
+    public WinReInfo? WinRe { get; init; }
     public IReadOnlyList<DiskInfo> Disks { get; init; } = [];
     /// <summary>Machine-wide notes, plus anything discovery could not determine.</summary>
     public IReadOnlyList<Issue> Issues { get; init; } = [];
