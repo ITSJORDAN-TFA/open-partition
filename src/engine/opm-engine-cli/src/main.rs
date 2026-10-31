@@ -280,9 +280,10 @@ fn move_partition(o: &Options) -> Result<(), Failure> {
     for l in &locks {
         match l.free_unknown() {
             None => println!(
-                "locked={} free_bytes={}",
+                "locked={} free_bytes={} free_source={}",
                 l.path(),
-                l.free_runs().iter().map(|r| r.1).sum::<u64>()
+                l.free_runs().iter().map(|r| r.1).sum::<u64>(),
+                l.free_source().replace(' ', "_")
             ),
             Some(why) => println!(
                 "locked={} free_bytes=unknown reason={}",

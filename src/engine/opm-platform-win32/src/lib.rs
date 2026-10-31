@@ -19,6 +19,7 @@ mod handle;
 mod journal_file;
 mod layout;
 mod mounted_devices;
+mod ntfs;
 mod smbios;
 mod volume;
 

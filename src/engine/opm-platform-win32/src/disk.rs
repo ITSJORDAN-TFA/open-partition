@@ -27,16 +27,16 @@ const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x0007_0140;
 /// unbuffered I/O needs.
 const PIECE: usize = 8 << 20;
 const LANES: usize = 4;
-const BOUNCE_ALIGN: usize = 4096;
+pub(crate) const BOUNCE_ALIGN: usize = 4096;
 
 #[derive(Debug)]
-struct AlignedBuffer {
+pub(crate) struct AlignedBuffer {
     ptr: *mut u8,
     len: usize,
 }
 
 impl AlignedBuffer {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         let layout = AllocLayout::from_size_align(len, BOUNCE_ALIGN).expect("valid bounce layout");
         #[allow(unsafe_code)]
         // SAFETY: the layout has non-zero size.
@@ -45,7 +45,7 @@ impl AlignedBuffer {
         Self { ptr, len }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         #[allow(unsafe_code)]
         // SAFETY: `ptr` points to `len` initialised bytes owned by `self`.
         unsafe {
@@ -183,7 +183,7 @@ impl Drop for AlignedBuffer {
     }
 }
 
-fn overlapped_at(offset: u64) -> OVERLAPPED {
+pub(crate) fn overlapped_at(offset: u64) -> OVERLAPPED {
     #[allow(unsafe_code)]
     // SAFETY: OVERLAPPED is plain data; all-zero is its documented initial state.
     let mut o: OVERLAPPED = unsafe { std::mem::zeroed() };

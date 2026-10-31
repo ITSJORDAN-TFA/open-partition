@@ -294,6 +294,24 @@ Shipped since the "Operations in the GUI and CLI" section above:
   copied (safe fallback, logged per volume as `free_bytes=unknown`). Reading the bitmap before
   the lock is unsafe (allocations in between would be skipped). Next: find a lock-safe way, e.g.
   parse `$Bitmap` through the locked handle.
+  - **Fix (#7, pending Azure confirmation):** `opm-platform-win32/src/ntfs.rs` is a read-only
+    NTFS parser (no `unsafe`): boot sector -> `$MFT` record 0 -> record 3 (`$Volume`, refuses a
+    dirty volume) -> record 6 (`$Bitmap`) unnamed `$DATA` runlist -> bitmap bytes. It checks
+    fixups, record numbers, attribute and runlist bounds, sizes against the boot sector's
+    cluster count, and that the boot sector, `$MFT` and `$Bitmap` clusters are marked used. It
+    refuses attribute lists, sparse/compressed/encrypted data, and MFT records outside
+    1-4 KiB; any refusal means a full copy.
+  - `LockedVolume::lock` still asks the FSCTLs under the lock (before the dismount), then reads
+    `$Bitmap` raw through the locking handle *after* `FSCTL_DISMOUNT_VOLUME` (the log is
+    checkpointed and nothing can allocate, so the on-disk bitmap is final). Both work: a
+    cluster is free only if free in both. One works: that one. Neither, or dirty: full copy.
+  - The log line is `locked=… free_bytes=<n> free_source=raw+fsctl|raw (…)|fsctl (…)`. VHDX
+    move scenarios now require `raw+fsctl` on NTFS volumes (proves the parser on real NTFS);
+    Server 2016 is expected to show `raw (FSCTL: OS error 0x00000015)`. Unverified until the
+    self-test move round passes there: raw reads on a dismounted, locked volume handle.
+  - Unit tests build synthetic NTFS images (512 B/4 KiB sectors, 512 B-128 KiB clusters,
+    records straddling MFT runs) and mutate them: 20,000 corrupted variants never panic and
+    never report a used cluster free.
 - **GUI:**
   - New look (sidebar, summary cards, tile map, partition table, details pane, footer Apply).
   - Icons (`assets/brand`).
