@@ -30,9 +30,11 @@ usage:
   opm-engine status  --journal PATH
   opm-engine grow-extended --disk N --offset BYTES --length BYTES
   opm-engine hash    --disk N --offset BYTES --length BYTES
+  opm-engine bench   --disk N --offset BYTES --length BYTES [--seconds S]
 
-Every command that opens a disk also takes --snapshot-confirmed NAME. Without it only VHD/VHDX
-test disks can be opened; with it, real disks too, but only on an Azure VM.";
+Every command that opens a disk for writing also takes --snapshot-confirmed NAME. Without it
+only VHD/VHDX test disks can be opened; with it, real disks too, but only on an Azure VM.
+bench only reads, so it opens any disk read-only and needs no snapshot.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +56,7 @@ fn main() -> ExitCode {
         "rollback" => rollback(&options),
         "compare" => compare(&options),
         "hash" => hash(&options),
+        "bench" => bench(&options),
         "status" => status(&options),
         "grow-extended" => grow_extended(&options),
         _ => Err(Failure::Usage(format!("unknown command '{command}'"))),
@@ -187,6 +190,27 @@ fn hash(o: &Options) -> Result<(), Failure> {
         "sha256={}",
         hex(&disk.range_digest(o.number("offset")?, o.number("length")?)?)
     );
+    Ok(())
+}
+
+/// Read-only: how fast the disk reads through the path a move uses, so the GUI can estimate
+/// how long a move takes. Reads at most `--seconds` (default 3, at most 30) of the range.
+fn bench(o: &Options) -> Result<(), Failure> {
+    let seconds = o.optional_number("seconds")?.unwrap_or(3);
+    if !(1..=30).contains(&seconds) {
+        return Err(Failure::Usage("--seconds must be 1 to 30".into()));
+    }
+    let mut disk = PhysicalDisk::open_read_only(o.disk()?)?;
+    let offset = o.number("offset")?;
+    let length = o.number("length")?;
+    let result = disk.bench(offset, length, Duration::from_secs(seconds))?;
+    println!(
+        "bench bytes={} milliseconds={} bytes_per_second={}",
+        result.bytes,
+        result.elapsed.as_millis(),
+        result.bytes_per_second()
+    );
+    println!("result=done");
     Ok(())
 }
 
