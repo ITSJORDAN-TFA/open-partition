@@ -98,6 +98,30 @@ SYS by moving the extended partition and PRIM, extend SYS), including an engine 
 resume`; the GUI driven by UI Automation through the same flow
 (`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
+### Who holds a volume open (2026-11-01, #9)
+
+When the engine can't lock a volume, `VolumeUsers.Diagnose` names the holders and
+`VolumeUsers.Format` (pure, xUnit-tested) words the message. Detection is read-only:
+`NtQuerySystemInformation(SystemExtendedHandleInformation)` lists every handle; file handles
+are duplicated into our process, filtered to disk files with `GetFileType` (pipes can block a
+name query forever), then `GetFinalPathNameByHandle(VOLUME_NAME_NT)` is matched against the
+volume's NT device name (`QueryDosDevice("Volume{…}")`), so volumes without a drive letter work
+too. Every query runs under a 1 s per-handle watchdog (a stuck worker thread is abandoned) and a
+20 s overall budget. Restart Manager is then asked about the files found, for friendly names.
+Services come from `Win32_Service.ProcessId`; running dependents via `Win32_DependentService`.
+Quirks worth knowing:
+- Restart Manager alone can't answer "what uses this volume": it needs the file names first.
+- Without elevation (or for protected processes) `OpenProcess(PROCESS_DUP_HANDLE)` fails; the
+  scan reports itself partial and the message falls back to Resource Monitor / handle.exe.
+- Process 4 (System) holds page files, SMB-shared files and driver files; it is named as
+  "Windows itself" with advice instead of a stop button.
+- Shared `svchost.exe` hosts (normal on Server 2016, which predates the per-service split) get
+  no stop button: we can't tell which of its services holds the file.
+The GUI offers "Stop service X and retry" only for services in their own process that accept
+stop; it asks first, stops dependents first, never stops processes, and doesn't restart the
+services afterwards (it tells the user to). Services are never stopped in tests; the harness
+test (`Test-LockFailureNamesTheProgramHoldingAFile`) only uses a child process it started.
+
 ---
 
 ## 1. Decisions to make now
