@@ -16,22 +16,25 @@ pub const RECORD_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"OPMJRNL\0";
 /// Bump when the record layout changes. Older engines refuse newer journals instead of
 /// misreading them.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 4;
 
 const CRC_OFFSET: usize = RECORD_SIZE - 4;
 const ENTRY_OFFSET: usize = 176;
+const FLAGS_OFFSET: usize = ENTRY_OFFSET + ENTRY_SIZE;
+const MAP_DIGEST_OFFSET: usize = FLAGS_OFFSET + 2;
 
 /// Opaque identity of the partition being moved: the GPT partition GUID, or an MBR key the
 /// platform layer chooses. The core only compares and stores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionKey(pub [u8; 16]);
 
-/// Size of a [`PartitionEntry`] snapshot.
-pub const ENTRY_SIZE: usize = 256;
+/// Size of a [`PartitionEntry`] snapshot. Large enough for an MBR extended partition together
+/// with the entries of the logical drives inside it, which move as one block.
+pub const ENTRY_SIZE: usize = 3584;
 
-/// Opaque snapshot of the partition's table entry (type, attributes, name, flags...), taken
-/// before the move. The entry is removed from the table for the whole move and put back from
-/// this snapshot at the new position (gaps G9, G10). The platform layer chooses the format.
+/// Opaque snapshot of the partition's table entries (type, attributes, name, flags...), taken
+/// before the move. The entries are removed from the table for the whole move and put back
+/// from this snapshot at the new position (gaps G9, G10). The platform layer chooses the format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionEntry(pub [u8; ENTRY_SIZE]);
 
@@ -78,9 +81,15 @@ pub struct MoveRecord {
     pub direction: Direction,
     pub phase: Phase,
     pub chunks_done: u64,
-    /// Digest of the source range taken under the volume lock before anything was written.
-    /// When present, the target must match it before the partition is revealed (plan section 6).
+    /// Whether the copy is verified against a digest of the source (plan section 6).
+    pub verify: bool,
+    /// Digest of the source's mapped parts, taken once the entry is out of the table and before
+    /// any chunk is copied, so nothing can change the source after it. `None` until then.
+    /// The target must match it before the partition is revealed.
     pub source_digest: Option<[u8; 32]>,
+    /// Identifies the copy map (the parts of the partition that hold data), so recovery
+    /// copies exactly the same parts. `None` means the whole partition.
+    pub map_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +140,11 @@ impl MoveRecord {
             out[137..169].copy_from_slice(&digest);
         }
         out[ENTRY_OFFSET..ENTRY_OFFSET + ENTRY_SIZE].copy_from_slice(&self.entry.0);
+        out[FLAGS_OFFSET] = u8::from(self.verify);
+        if let Some(digest) = self.map_digest {
+            out[FLAGS_OFFSET + 1] = 1;
+            out[MAP_DIGEST_OFFSET..MAP_DIGEST_OFFSET + 32].copy_from_slice(&digest);
+        }
         let crc = crc32(&out[..CRC_OFFSET]);
         out[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
     }
@@ -179,9 +193,21 @@ impl MoveRecord {
             direction,
             phase,
             chunks_done: u64_at(96),
+            verify: match buf[FLAGS_OFFSET] {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Corrupt),
+            },
             source_digest: match buf[136] {
                 0 => None,
                 1 => buf[137..169].try_into().ok(),
+                _ => return Err(DecodeError::Corrupt),
+            },
+            map_digest: match buf[FLAGS_OFFSET + 1] {
+                0 => None,
+                1 => buf[MAP_DIGEST_OFFSET..MAP_DIGEST_OFFSET + 32]
+                    .try_into()
+                    .ok(),
                 _ => return Err(DecodeError::Corrupt),
             },
         })
@@ -312,7 +338,9 @@ mod tests {
             direction: Direction::Backward,
             phase: Phase::Copying,
             chunks_done: 3,
+            verify: true,
             source_digest: Some([5; 32]),
+            map_digest: Some([6; 32]),
         }
     }
 

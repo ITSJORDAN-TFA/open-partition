@@ -6,8 +6,9 @@
 use opm_core::journal::load_newest;
 use opm_core::mover::{default_chunk_size, validate};
 use opm_core::{
-    recover, start_move, BlockDevice, DeviceJournal, DiskIdentity, IoError, MoveError, MoveJob,
-    PartitionEntry, PartitionKey, PartitionTable, Phase, RangeDigest, Recovery, ENTRY_SIZE,
+    recover, recover_with_progress, roll_back, start_move, start_move_with_progress, BlockDevice,
+    CopyMap, DeviceJournal, DiskIdentity, IoError, MoveError, MoveJob, PartitionEntry,
+    PartitionKey, PartitionTable, Phase, RangeDigest, Recovery, ENTRY_SIZE,
 };
 use opm_platform_sim::{run_campaign, CampaignOptions, LossModel, Power, SimDisk, SimWorld};
 
@@ -124,12 +125,18 @@ impl PartitionTable for TableDisk {
     }
 }
 
+fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
 impl RangeDigest for TableDisk {
-    fn range_digest(&mut self, offset: u64, length: u64) -> Result<[u8; 32], IoError> {
-        use sha2::{Digest, Sha256};
-        let mut buf = vec![0; length as usize];
-        self.read_at(offset, &mut buf)?;
-        Ok(Sha256::digest(&buf).into())
+    fn digest(&mut self, parts: &[&[u8]]) -> [u8; 32] {
+        sha256(parts)
     }
 }
 
@@ -516,9 +523,10 @@ fn default_chunk_size_is_always_valid() {
     }
 }
 
-/// Writes and flushes on the power rail: journal write+flush, detach write+flush. Each chunk
-/// then costs 4 more (data write+flush, checkpoint write+flush).
-const OPS_BEFORE_FIRST_CHUNK: u64 = 4;
+/// Writes and flushes on the power rail: journal write+flush, detach write+flush, then the
+/// source digest's checkpoint write+flush. Each chunk then costs 4 more (data write+flush,
+/// checkpoint write+flush).
+const OPS_BEFORE_FIRST_CHUNK: u64 = 6;
 
 #[test]
 fn partition_is_out_of_the_table_while_data_is_in_flux() {
@@ -612,5 +620,354 @@ fn corrupted_copy_is_caught_before_the_partition_is_revealed() {
         m.data.partition_start(KEY).unwrap(),
         None,
         "a copy that failed verification must stay out of the table"
+    );
+}
+
+impl Scenario {
+    /// Roll the move back; if it is already past the point of no return, finish it instead.
+    fn roll_back_or_finish(&self, m: &mut Machine) -> Result<(), MoveError> {
+        match roll_back(&mut m.data, &mut m.journal, IDENTITY) {
+            Ok(_) => Ok(()),
+            Err(MoveError::UnexpectedLayout { found: Some(t), .. })
+                if t == self.bytes(self.target) =>
+            {
+                recover(&mut m.data, &mut m.journal, IDENTITY).map(|_| ())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[test]
+fn rollback_survives_crashes_anywhere() {
+    let s = Scenario {
+        sector: 512,
+        disk: 128,
+        source: 8,
+        target: 80,
+        length: 24,
+        chunk: 8,
+    };
+    let report = run_campaign(
+        || s.setup(),
+        |m| s.operation(m),
+        |m| s.roll_back_or_finish(m),
+        |m| s.verify(m),
+        CampaignOptions {
+            random_seeds: 2,
+            crash_during_recovery: true,
+        },
+    );
+    report.assert_passed();
+}
+
+#[test]
+fn copy_that_fails_verification_rolls_back_to_the_source() {
+    let s = Scenario {
+        sector: 512,
+        disk: 128,
+        source: 8,
+        target: 80,
+        length: 24,
+        chunk: 8,
+    };
+    let m = s.setup();
+    // Crash on the flush of the last checkpoint: copy complete, entry out of the table.
+    m.data.0.arm_crash(OPS_BEFORE_FIRST_CHUNK + 3 * 4 - 1);
+    let mut m = m;
+    assert_eq!(s.operation(&mut m), Err(MoveError::Io(IoError::Crashed)));
+    let mut m = m.power_cycle(LossModel::KeepAll);
+    let target = s.bytes(s.target);
+    m.data.write_at(target, &vec![0xEE; 512]).unwrap();
+    m.data.flush().unwrap();
+    assert_eq!(
+        Scenario::recover(&mut m),
+        Err(MoveError::VerifyFailed { offset: target })
+    );
+    let Ok(Recovery::Completed(record)) = roll_back(&mut m.data, &mut m.journal, IDENTITY) else {
+        panic!("rollback failed");
+    };
+    assert_eq!(
+        (record.phase, record.target_offset),
+        (Phase::Done, s.bytes(s.source))
+    );
+    assert_eq!(
+        m.data.partition_start(KEY).unwrap(),
+        Some(s.bytes(s.source))
+    );
+    s.verify(&mut m).unwrap();
+    assert_eq!(Scenario::recover(&mut m), Ok(()), "nothing left to recover");
+}
+
+#[test]
+fn overlapping_move_cannot_be_rolled_back() {
+    let s = Scenario {
+        sector: 512,
+        disk: 64,
+        source: 8,
+        target: 12,
+        length: 16,
+        chunk: 4,
+    };
+    let m = s.setup();
+    m.data.0.arm_crash(OPS_BEFORE_FIRST_CHUNK + 4);
+    let mut m = m;
+    assert_eq!(s.operation(&mut m), Err(MoveError::Io(IoError::Crashed)));
+    let mut m = m.power_cycle(LossModel::KeepAll);
+    let ops = m.data.0.ops();
+    assert!(matches!(
+        roll_back(&mut m.data, &mut m.journal, IDENTITY),
+        Err(MoveError::InvalidJob(_))
+    ));
+    assert_eq!(m.data.0.ops(), ops, "a refused rollback writes nothing");
+}
+
+/// A disk on which something else writes into the source while the move runs: on the move's
+/// first data write, `junk_at` (absolute) is overwritten first.
+#[derive(Debug)]
+struct BusyDisk {
+    inner: TableDisk,
+    junk_at: Option<u64>,
+}
+
+impl BlockDevice for BusyDisk {
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+    fn size_bytes(&self) -> u64 {
+        self.inner.size_bytes()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
+        if offset != 0 {
+            if let Some(at) = self.junk_at.take() {
+                self.inner.write_at(at, &[0xEE; 512])?;
+            }
+        }
+        self.inner.write_at(offset, data)
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.inner.flush()
+    }
+}
+
+impl PartitionTable for BusyDisk {
+    fn partition_start(&mut self, p: PartitionKey) -> Result<Option<u64>, IoError> {
+        self.inner.partition_start(p)
+    }
+    fn entry(&mut self, p: PartitionKey) -> Result<PartitionEntry, IoError> {
+        self.inner.entry(p)
+    }
+    fn detach(&mut self, p: PartitionKey) -> Result<(), IoError> {
+        self.inner.detach(p)
+    }
+    fn attach(&mut self, p: PartitionKey, e: &PartitionEntry, start: u64) -> Result<(), IoError> {
+        self.inner.attach(p, e, start)
+    }
+    fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError> {
+        self.inner.range_is_free(start, length)
+    }
+}
+
+impl RangeDigest for BusyDisk {
+    fn digest(&mut self, parts: &[&[u8]]) -> [u8; 32] {
+        sha256(parts)
+    }
+}
+
+#[test]
+fn source_changing_under_the_move_stops_it_at_once_and_rolls_back() {
+    let s = Scenario {
+        sector: 512,
+        disk: 128,
+        source: 8,
+        target: 80,
+        length: 24,
+        chunk: 8,
+    };
+    let m = s.setup();
+    // Moving right copies the last chunk first; damage the first one, copied last.
+    let mut disk = BusyDisk {
+        inner: m.data,
+        junk_at: Some(s.bytes(s.source)),
+    };
+    let mut journal = m.journal;
+    let mut copied = 0;
+    let result = start_move_with_progress(
+        &mut disk,
+        &mut journal,
+        IDENTITY,
+        &s.job(),
+        &[],
+        &CopyMap::full(s.bytes(s.length)),
+        &mut |p| copied = p.chunks_done,
+    );
+    assert_eq!(
+        result,
+        Err(MoveError::SourceChanged {
+            offset: s.bytes(s.source)
+        })
+    );
+    assert_eq!(
+        copied, 2,
+        "stopped at the changed chunk, not after the copy"
+    );
+    assert_eq!(disk.inner.partition_start(KEY).unwrap(), None);
+    let Ok(Recovery::Completed(_)) = roll_back(&mut disk.inner, &mut journal, IDENTITY) else {
+        panic!("rollback failed");
+    };
+    assert_eq!(
+        disk.inner.partition_start(KEY).unwrap(),
+        Some(s.bytes(s.source))
+    );
+}
+
+/// Only every other 2-sector block of the partition holds data.
+fn sparse_map(s: &Scenario) -> CopyMap {
+    let ranges = (0..s.length / 4)
+        .map(|i| (s.bytes(i * 4), s.bytes(2)))
+        .collect();
+    CopyMap {
+        ranges,
+        digest: Some([0xAB; 32]),
+    }
+}
+
+impl Scenario {
+    /// Like `verify`, but only the mapped parts must hold the partition's data.
+    fn verify_mapped(&self, m: &mut Machine, map: &CopyMap) -> Result<(), String> {
+        let row = m
+            .data
+            .row_of(KEY)
+            .map_err(|e| e.to_string())?
+            .ok_or("partition left out of the table")?;
+        let journal = load_newest(&mut m.journal).map_err(|e| format!("{e:?}"))?;
+        if journal.is_some_and(|r| r.phase != Phase::Done) {
+            return Err(format!("journal unfinished: {journal:?}"));
+        }
+        if row.start != self.bytes(self.target) && row.start != self.bytes(self.source) {
+            return Err(format!("partition at {}", row.start));
+        }
+        let mut buf = vec![0; self.bytes(self.length) as usize];
+        m.data
+            .read_at(row.start, &mut buf)
+            .map_err(|e| e.to_string())?;
+        for &(start, len) in &map.ranges {
+            let range = start as usize..(start + len) as usize;
+            if let Some(i) = range.clone().find(|&i| buf[i] != Self::partition_byte(i)) {
+                return Err(format!("mapped data wrong at partition byte {i}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn mapped_move_survives_crashes_anywhere() {
+    for (source, target) in [(8u64, 12u64), (12, 8)] {
+        let s = Scenario {
+            sector: 512,
+            disk: 64,
+            source,
+            target,
+            length: 16,
+            chunk: 4,
+        };
+        let map = sparse_map(&s);
+        let report = run_campaign(
+            || s.setup(),
+            |m| {
+                start_move_with_progress(
+                    &mut m.data,
+                    &mut m.journal,
+                    IDENTITY,
+                    &s.job(),
+                    &[],
+                    &map,
+                    &mut |_| {},
+                )
+                .map(|_| ())
+            },
+            |m| {
+                recover_with_progress(&mut m.data, &mut m.journal, IDENTITY, &map, &mut |_| {})
+                    .map(|_| ())
+            },
+            |m| s.verify_mapped(m, &map),
+            CampaignOptions {
+                random_seeds: 2,
+                crash_during_recovery: true,
+            },
+        );
+        report.assert_passed();
+    }
+}
+
+#[test]
+fn mapped_move_copies_only_the_mapped_parts() {
+    let s = Scenario {
+        sector: 512,
+        disk: 128,
+        source: 8,
+        target: 80,
+        length: 24,
+        chunk: 8,
+    };
+    let mut m = s.setup();
+    let map = sparse_map(&s);
+    let before = m.data.0.contents().to_vec();
+    start_move_with_progress(
+        &mut m.data,
+        &mut m.journal,
+        IDENTITY,
+        &s.job(),
+        &[],
+        &map,
+        &mut |_| {},
+    )
+    .unwrap();
+    let after = m.data.0.contents();
+    let target = s.bytes(s.target) as usize;
+    for i in 0..s.bytes(s.length) as usize {
+        let mapped = map.parts(i as u64, 1).next().is_some();
+        if !mapped {
+            assert_eq!(
+                after[target + i],
+                before[target + i],
+                "unmapped byte {i} was written"
+            );
+        }
+    }
+    s.verify_mapped(&mut m, &map).unwrap();
+}
+
+#[test]
+fn recovery_with_a_different_map_is_refused() {
+    let s = Scenario {
+        sector: 512,
+        disk: 64,
+        source: 8,
+        target: 12,
+        length: 16,
+        chunk: 4,
+    };
+    let m = s.setup();
+    m.data.0.arm_crash(OPS_BEFORE_FIRST_CHUNK + 4);
+    let mut m = m;
+    let map = sparse_map(&s);
+    let _ = start_move_with_progress(
+        &mut m.data,
+        &mut m.journal,
+        IDENTITY,
+        &s.job(),
+        &[],
+        &map,
+        &mut |_| {},
+    );
+    let mut m = m.power_cycle(LossModel::KeepAll);
+    assert_eq!(
+        recover(&mut m.data, &mut m.journal, IDENTITY),
+        Err(MoveError::MapMismatch)
     );
 }

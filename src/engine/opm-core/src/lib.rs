@@ -16,6 +16,6 @@ pub use journal::{
     ENTRY_SIZE,
 };
 pub use mover::{
-    recover, recover_with_progress, start_move, start_move_with_progress, DiskIdentity, MoveError,
-    MoveJob, PartitionTable, Progress, RangeDigest, Recovery,
+    recover, recover_with_progress, roll_back, start_move, start_move_with_progress, CopyMap,
+    DiskIdentity, MoveError, MoveJob, PartitionTable, Progress, RangeDigest, Recovery, Stage,
 };

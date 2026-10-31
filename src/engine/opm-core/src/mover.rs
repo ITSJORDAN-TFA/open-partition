@@ -11,8 +11,13 @@
 //! refuse raw writes into any partition's sectors unless its volume is locked, which is
 //! impossible once the volume is gone; a removed entry avoids that too (G10). The journal holds
 //! a snapshot of the entry, and the final table update puts it back at the target in one write.
+//!
+//! Only the parts of the partition that hold data are hashed and copied ([`CopyMap`]). The
+//! source is hashed chunk by chunk once the entry is out of the table, and each chunk is checked
+//! against its hash as it is copied, so data that changes under the move is caught at once.
 
 use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
 use core::ops::Range;
 
@@ -22,8 +27,9 @@ use crate::journal::{
     PartitionEntry, PartitionKey, Phase,
 };
 
-/// Largest chunk the mover uses. Bigger chunks are faster but hold more data in memory.
-pub const MAX_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+/// Largest chunk the mover uses. Each chunk is flushed, read back and checkpointed, so bigger
+/// chunks are faster, but the mover holds two of them in memory.
+pub const MAX_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
 
 /// Access to the partition table of the disk being moved on. On Windows this wraps
 /// `IOCTL_DISK_GET/SET_DRIVE_LAYOUT_EX`; in tests it is a simulated table.
@@ -52,15 +58,80 @@ pub trait PartitionTable {
     fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError>;
 }
 
-/// A strong digest (SHA-256 on Windows) of a byte range of the disk. Kept out of the core so
-/// it stays dependency-free.
+/// A strong digest (SHA-256 on Windows) of data the mover has read. Kept out of the core so it
+/// stays dependency-free.
 pub trait RangeDigest {
-    fn range_digest(&mut self, offset: u64, length: u64) -> Result<[u8; 32], IoError>;
+    /// Digest of `parts`, concatenated.
+    fn digest(&mut self, parts: &[&[u8]]) -> [u8; 32];
 }
 
-/// Reported after each chunk is copied and checkpointed.
+/// The parts of a partition that hold data, as sorted, non-overlapping, sector-aligned
+/// `(start, length)` byte ranges relative to the partition start. Only these are hashed and
+/// copied; the rest is free space whose contents don't matter (free NTFS clusters).
+/// `digest` identifies the map in the journal so recovery copies exactly the same parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyMap {
+    pub ranges: Vec<(u64, u64)>,
+    pub digest: Option<[u8; 32]>,
+}
+
+impl CopyMap {
+    /// Copy everything.
+    pub fn full(length: u64) -> Self {
+        Self {
+            ranges: vec![(0, length)],
+            digest: None,
+        }
+    }
+
+    /// Bytes the map covers.
+    pub fn bytes(&self) -> u64 {
+        self.ranges.iter().map(|r| r.1).sum()
+    }
+
+    /// The mapped parts of `[start, start + len)`, clipped to it.
+    pub fn parts(&self, start: u64, len: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let end = start + len;
+        let first = self.ranges.partition_point(|&(s, l)| s + l <= start);
+        self.ranges[first..]
+            .iter()
+            .take_while(move |&&(s, _)| s < end)
+            .map(move |&(s, l)| {
+                let a = s.max(start);
+                (a, (s + l).min(end) - a)
+            })
+    }
+
+    fn check(&self, length: u64, sector: u64) -> Result<(), MoveError> {
+        let mut end = 0;
+        for &(s, l) in &self.ranges {
+            if l == 0 || s < end || s % sector != 0 || l % sector != 0 || s + l > length {
+                return Err(MoveError::InvalidJob(
+                    "copy map ranges must be sorted, sector aligned and inside the partition",
+                ));
+            }
+            end = s + l;
+        }
+        Ok(())
+    }
+}
+
+/// What the mover is doing when it reports progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Reading the source to take its digest, before anything is copied.
+    Hashing,
+    /// Copying chunks to the target.
+    Copying,
+    /// Reading the finished copy back to compare it with the source digest (only after a
+    /// restart; otherwise each chunk was already checked as it was copied).
+    Verifying,
+}
+
+/// Reported after each chunk is hashed, copied or verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
+    pub stage: Stage,
     pub chunks_done: u64,
     pub chunks_total: u64,
     pub bytes_done: u64,
@@ -104,10 +175,17 @@ pub enum MoveError {
         expected: u64,
         found: Option<u64>,
     },
-    /// A chunk read back from the target did not match what was written.
+    /// A chunk read back from the target did not match what was written, or the finished
+    /// copy does not match the source digest.
     VerifyFailed {
         offset: u64,
     },
+    /// The source changed after it was hashed: something wrote to the disk under the move.
+    SourceChanged {
+        offset: u64,
+    },
+    /// The copy map given to recovery is not the one the move was journaled with.
+    MapMismatch,
     /// Another partition was created over the data being moved while its entry was out of
     /// the table. Nothing more is written.
     RangeInUse {
@@ -145,6 +223,12 @@ impl fmt::Display for MoveError {
             }
             MoveError::VerifyFailed { offset } => {
                 write!(f, "verification failed for data at byte {offset}")
+            }
+            MoveError::SourceChanged { offset } => {
+                write!(f, "the data at byte {offset} changed after it was hashed, while the move was running: something is writing to the disk underneath the file system")
+            }
+            MoveError::MapMismatch => {
+                f.write_str("the copy map does not match the one the move was journaled with")
             }
             MoveError::RangeInUse { offset } => {
                 write!(f, "another partition now overlaps the data being moved at byte {offset}; it was created while the move was unfinished")
@@ -253,16 +337,18 @@ where
     D: BlockDevice + PartitionTable + RangeDigest,
     J: JournalStore,
 {
-    start_move_with_progress(disk, journal, identity, job, reserved, &mut |_| {})
+    let map = CopyMap::full(job.length);
+    start_move_with_progress(disk, journal, identity, job, reserved, &map, &mut |_| {})
 }
 
-/// [`start_move`] that calls `progress` after every checkpointed chunk.
+/// [`start_move`] that copies only the parts in `map` and calls `progress` as it goes.
 pub fn start_move_with_progress<D, J>(
     disk: &mut D,
     journal: &mut J,
     identity: DiskIdentity,
     job: &MoveJob,
     reserved: &[Range<u64>],
+    map: &CopyMap,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<MoveRecord, MoveError>
 where
@@ -270,6 +356,7 @@ where
     J: JournalStore,
 {
     let direction = validate(job, disk, reserved)?;
+    map.check(job.length, u64::from(disk.sector_size()))?;
     let previous = load_newest(journal)?;
     if previous.is_some_and(|r| r.phase != Phase::Done) {
         return Err(MoveError::PendingOperation);
@@ -284,11 +371,6 @@ where
         }
     }
     let entry = disk.entry(job.partition)?;
-    let source_digest = if job.verify {
-        Some(disk.range_digest(job.source_offset, job.length)?)
-    } else {
-        None
-    };
 
     let record = MoveRecord {
         sequence: previous.map_or(1, |r| r.sequence + 1),
@@ -305,11 +387,13 @@ where
         direction,
         phase: Phase::Copying,
         chunks_done: 0,
-        source_digest,
+        verify: job.verify,
+        source_digest: None,
+        map_digest: map.digest,
     };
     // The journal must be durable before the table or any data is touched.
     commit(journal, &record)?;
-    run(disk, journal, record, progress)
+    run(disk, journal, record, map, progress)
 }
 
 // Returned once per recovery, so the size of the record does not matter.
@@ -333,14 +417,20 @@ where
     D: BlockDevice + PartitionTable + RangeDigest,
     J: JournalStore,
 {
-    recover_with_progress(disk, journal, identity, &mut |_| {})
+    let Some(record) = load_newest(journal)? else {
+        return Ok(Recovery::NothingToDo);
+    };
+    let map = CopyMap::full(record.length);
+    recover_with_progress(disk, journal, identity, &map, &mut |_| {})
 }
 
-/// [`recover`] that calls `progress` after every checkpointed chunk.
+/// [`recover`] with the copy map the move was started with (the whole partition if it had
+/// none), calling `progress` as it goes.
 pub fn recover_with_progress<D, J>(
     disk: &mut D,
     journal: &mut J,
     identity: DiskIdentity,
+    map: &CopyMap,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Recovery, MoveError>
 where
@@ -359,7 +449,60 @@ where
     {
         return Err(MoveError::WrongDisk);
     }
-    run(disk, journal, record, progress).map(Recovery::Completed)
+    run(disk, journal, record, map, progress).map(Recovery::Completed)
+}
+
+/// Undo an unfinished move instead of finishing it: put the partition's entry back at its
+/// source, as it was before the move. Only possible while the source has never been written,
+/// which is the case when source and target do not overlap. Use it when finishing is
+/// impossible, such as when the copy fails verification.
+///
+/// Safe to interrupt and call again. The final (`Done`) record has the source as its target. Refuses with [`MoveError::UnexpectedLayout`] if the entry is already at the target:
+/// the move is then complete apart from bookkeeping and must be finished with [`recover`].
+pub fn roll_back<D, J>(
+    disk: &mut D,
+    journal: &mut J,
+    identity: DiskIdentity,
+) -> Result<Recovery, MoveError>
+where
+    D: BlockDevice + PartitionTable,
+    J: JournalStore,
+{
+    let Some(mut record) = load_newest(journal)?.filter(|r| r.phase != Phase::Done) else {
+        return Ok(Recovery::NothingToDo);
+    };
+    if record.disk_id != identity.id
+        || record.disk_size != disk.size_bytes()
+        || record.sector_size != disk.sector_size()
+    {
+        return Err(MoveError::WrongDisk);
+    }
+    if record.source_offset.abs_diff(record.target_offset) < record.length {
+        return Err(MoveError::InvalidJob(
+            "the move overlaps its source, so part of the original data has been overwritten; it can only be finished",
+        ));
+    }
+    match disk.partition_start(record.partition)? {
+        Some(start) if start == record.source_offset => {}
+        None => {
+            if !disk.range_is_free(record.source_offset, record.length)? {
+                return Err(MoveError::RangeInUse {
+                    offset: record.source_offset,
+                });
+            }
+            disk.attach(record.partition, &record.entry, record.source_offset)?;
+        }
+        found => {
+            return Err(MoveError::UnexpectedLayout {
+                expected: record.source_offset,
+                found,
+            })
+        }
+    }
+    record.target_offset = record.source_offset;
+    record.phase = Phase::Done;
+    advance(journal, &mut record)?;
+    Ok(Recovery::Completed(record))
 }
 
 /// Byte range of chunk `index` relative to the start of the partition.
@@ -404,18 +547,95 @@ fn advance<J: JournalStore>(journal: &mut J, record: &mut MoveRecord) -> Result<
     Ok(())
 }
 
+/// Read the mapped parts of chunk `[offset, offset + len)` (relative to the partition) from the
+/// partition starting at `base` into `data`, at their positions within the chunk.
+fn read_parts<D: BlockDevice>(
+    disk: &mut D,
+    map: &CopyMap,
+    base: u64,
+    offset: u64,
+    len: u64,
+    data: &mut [u8],
+) -> Result<(), IoError> {
+    for (s, l) in map.parts(offset, len) {
+        let at = (s - offset) as usize;
+        disk.read_at(base + s, &mut data[at..at + l as usize])?;
+    }
+    Ok(())
+}
+
+/// Digest of the mapped parts of a chunk already read into `data`.
+fn digest_parts<D: RangeDigest>(
+    disk: &mut D,
+    map: &CopyMap,
+    offset: u64,
+    len: u64,
+    data: &[u8],
+) -> [u8; 32] {
+    let parts: Vec<&[u8]> = map
+        .parts(offset, len)
+        .map(|(s, l)| {
+            let at = (s - offset) as usize;
+            &data[at..at + l as usize]
+        })
+        .collect();
+    disk.digest(&parts)
+}
+
+/// Per-chunk digests of the partition starting at `base`, and the digest of them all.
+fn digest_chunks<D: BlockDevice + RangeDigest>(
+    disk: &mut D,
+    record: &MoveRecord,
+    map: &CopyMap,
+    base: u64,
+    stage: Stage,
+    data: &mut [u8],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(Vec<[u8; 32]>, [u8; 32]), IoError> {
+    let chunks = record.length.div_ceil(record.chunk_size);
+    let mut digests = Vec::with_capacity(chunks as usize);
+    for index in 0..chunks {
+        let (offset, len) = chunk_range(record, index);
+        read_parts(disk, map, base, offset, len, data)?;
+        digests.push(digest_parts(disk, map, offset, len, data));
+        progress(Progress {
+            stage,
+            chunks_done: index + 1,
+            chunks_total: chunks,
+            bytes_done: ((index + 1) * record.chunk_size).min(record.length),
+            bytes_total: record.length,
+        });
+    }
+    let all: Vec<u8> = digests.iter().flatten().copied().collect();
+    let whole = disk.digest(&[&all]);
+    Ok((digests, whole))
+}
+
 /// Drive a journaled move from whatever phase it is in to `Done`.
 fn run<D, J>(
     disk: &mut D,
     journal: &mut J,
     mut record: MoveRecord,
+    map: &CopyMap,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<MoveRecord, MoveError>
 where
     D: BlockDevice + PartitionTable + RangeDigest,
     J: JournalStore,
 {
+    if record.map_digest != map.digest {
+        return Err(MoveError::MapMismatch);
+    }
+    map.check(record.length, u64::from(record.sector_size))?;
     let chunks = record.length.div_ceil(record.chunk_size);
+    let size =
+        usize::try_from(record.chunk_size).map_err(|_| MoveError::Journal(DecodeError::Corrupt))?;
+    let mut data = vec![0u8; size];
+    let mut check = vec![0u8; size];
+    // Digests of every source chunk, taken in this run before the first chunk was copied. When
+    // present, every chunk was checked against them as it was copied, so the finished copy
+    // needs no second read.
+    let mut chunk_digests: Option<Vec<[u8; 32]>> = None;
     loop {
         match record.phase {
             Phase::Copying => {
@@ -432,21 +652,53 @@ where
                     }
                 }
                 expect_free(disk, &record)?;
-                let size = usize::try_from(record.chunk_size)
-                    .map_err(|_| MoveError::Journal(DecodeError::Corrupt))?;
-                let mut data = vec![0u8; size];
-                let mut check = vec![0u8; size];
+                if record.verify && record.source_digest.is_none() {
+                    // Hashed only now that the OS has no partition, volume or file system on
+                    // the source: nothing it does on the way out can change the data after this.
+                    if record.chunks_done != 0 {
+                        return Err(MoveError::Journal(DecodeError::Corrupt));
+                    }
+                    let (digests, whole) = digest_chunks(
+                        disk,
+                        &record,
+                        map,
+                        record.source_offset,
+                        Stage::Hashing,
+                        &mut data,
+                        progress,
+                    )?;
+                    record.source_digest = Some(whole);
+                    advance(journal, &mut record)?;
+                    chunk_digests = Some(digests);
+                }
                 while record.chunks_done < chunks {
-                    let (offset, len) = chunk_range(&record, record.chunks_done);
-                    let len = len as usize;
-                    let source = record.source_offset + offset;
-                    let target = record.target_offset + offset;
-                    disk.read_at(source, &mut data[..len])?;
-                    disk.write_at(target, &data[..len])?;
-                    disk.flush()?;
-                    disk.read_at(target, &mut check[..len])?;
-                    if data[..len] != check[..len] {
-                        return Err(MoveError::VerifyFailed { offset: target });
+                    let index = record.chunks_done;
+                    let (offset, len) = chunk_range(&record, index);
+                    read_parts(disk, map, record.source_offset, offset, len, &mut data)?;
+                    if let Some(digests) = &chunk_digests {
+                        if digest_parts(disk, map, offset, len, &data) != digests[index as usize] {
+                            return Err(MoveError::SourceChanged {
+                                offset: record.source_offset + offset,
+                            });
+                        }
+                    }
+                    let mut wrote = false;
+                    for (s, l) in map.parts(offset, len) {
+                        let at = (s - offset) as usize;
+                        disk.write_at(record.target_offset + s, &data[at..at + l as usize])?;
+                        wrote = true;
+                    }
+                    if wrote {
+                        disk.flush()?;
+                        read_parts(disk, map, record.target_offset, offset, len, &mut check)?;
+                        for (s, l) in map.parts(offset, len) {
+                            let range = (s - offset) as usize..(s - offset + l) as usize;
+                            if data[range.clone()] != check[range] {
+                                return Err(MoveError::VerifyFailed {
+                                    offset: record.target_offset + s,
+                                });
+                            }
+                        }
                     }
                     record.chunks_done += 1;
                     if record.chunks_done == chunks {
@@ -454,6 +706,7 @@ where
                     }
                     advance(journal, &mut record)?;
                     progress(Progress {
+                        stage: Stage::Copying,
                         chunks_done: record.chunks_done,
                         chunks_total: chunks,
                         bytes_done: (record.chunks_done * record.chunk_size).min(record.length),
@@ -472,12 +725,28 @@ where
                     None => {
                         expect_free(disk, &record)?;
                         // Last chance to catch a bad copy: the entry is still out of the table.
-                        if let Some(expected) = record.source_digest {
-                            if disk.range_digest(record.target_offset, record.length)? != expected {
-                                return Err(MoveError::VerifyFailed {
-                                    offset: record.target_offset,
-                                });
+                        // Not needed if every chunk was checked against its digest in this run.
+                        match record.source_digest {
+                            Some(expected) if chunk_digests.is_none() => {
+                                let (_, whole) = digest_chunks(
+                                    disk,
+                                    &record,
+                                    map,
+                                    record.target_offset,
+                                    Stage::Verifying,
+                                    &mut data,
+                                    progress,
+                                )?;
+                                if whole != expected {
+                                    return Err(MoveError::VerifyFailed {
+                                        offset: record.target_offset,
+                                    });
+                                }
                             }
+                            None if record.verify => {
+                                return Err(MoveError::Journal(DecodeError::Corrupt))
+                            }
+                            _ => {}
                         }
                         disk.attach(record.partition, &record.entry, record.target_offset)?;
                     }
@@ -610,7 +879,9 @@ mod tests {
             direction: Direction::Backward,
             phase: Phase::Copying,
             chunks_done: 0,
+            verify: false,
             source_digest: None,
+            map_digest: None,
         };
         assert_eq!(chunk_range(&record, 0), (1500, 1000));
         assert_eq!(chunk_range(&record, 1), (500, 1000));

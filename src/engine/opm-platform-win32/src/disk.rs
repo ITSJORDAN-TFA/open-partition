@@ -1,4 +1,5 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout as AllocLayout};
+use std::thread;
 
 use opm_core::{
     BlockDevice, DiskIdentity, IoError, PartitionEntry, PartitionKey, PartitionTable, RangeDigest,
@@ -9,9 +10,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use crate::guard::require_virtual_disk;
+use crate::guard::{require_writable, WriteAccess};
 use crate::handle::{last_error, Handle, GENERIC_READ, GENERIC_WRITE};
-use crate::layout::{Layout, LayoutStyle};
+use crate::layout::{is_extended_type, snapshot_records, Layout, LayoutStyle};
+use crate::mounted_devices::{self, Remap};
 use crate::PlatformError;
 
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
@@ -19,8 +21,12 @@ const IOCTL_DISK_GET_DRIVE_LAYOUT_EX: u32 = 0x0007_0050;
 const IOCTL_DISK_SET_DRIVE_LAYOUT_EX: u32 = 0x0007_C054;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x0007_0140;
 
-/// Unbuffered I/O needs sector-aligned memory; this is the bounce buffer for it.
-const BOUNCE_SIZE: usize = 4 << 20;
+/// Large reads and writes are split into pieces of this size and sent through [`LANES`]
+/// handles at once, so the disk always has several requests in flight (cloud disks only reach
+/// their rated throughput that way). Each lane has its own sector-aligned bounce buffer, which
+/// unbuffered I/O needs.
+const PIECE: usize = 8 << 20;
+const LANES: usize = 4;
 const BOUNCE_ALIGN: usize = 4096;
 
 #[derive(Debug)]
@@ -46,6 +52,122 @@ impl AlignedBuffer {
             std::slice::from_raw_parts_mut(self.ptr, self.len)
         }
     }
+}
+
+/// One parallel I/O path: its own handle to the disk and its own bounce buffer.
+#[derive(Debug)]
+struct Lane {
+    handle: Handle,
+    bounce: AlignedBuffer,
+}
+
+// SAFETY: a lane exclusively owns its handle (a kernel handle, usable from any thread) and its
+// heap buffer; it is only ever used by one thread at a time (moved in by `&mut`).
+#[allow(unsafe_code)]
+unsafe impl Send for Lane {}
+
+impl Lane {
+    fn open(path: &str) -> Result<Self, IoError> {
+        Ok(Self {
+            handle: Handle::open(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+            )?,
+            bounce: AlignedBuffer::new(PIECE),
+        })
+    }
+
+    /// Read one piece (at most [`PIECE`] bytes).
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        let n = buf.len();
+        let mut overlapped = overlapped_at(offset);
+        let mut read = 0u32;
+        let bounce = self.bounce.as_mut_slice();
+        #[allow(unsafe_code)]
+        // SAFETY: the bounce buffer is sector aligned and at least `n` bytes; the handle is
+        // synchronous, so OVERLAPPED only carries the offset and outlives the call.
+        let ok = unsafe {
+            ReadFile(
+                self.handle.raw(),
+                bounce.as_mut_ptr(),
+                n as u32,
+                &mut read,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        if read as usize != n {
+            return Err(IoError::OutOfRange);
+        }
+        buf.copy_from_slice(&bounce[..n]);
+        Ok(())
+    }
+
+    /// Write one piece (at most [`PIECE`] bytes).
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
+        let n = data.len();
+        let bounce = self.bounce.as_mut_slice();
+        bounce[..n].copy_from_slice(data);
+        let mut overlapped = overlapped_at(offset);
+        let mut written = 0u32;
+        #[allow(unsafe_code)]
+        // SAFETY: as in `read`.
+        let ok = unsafe {
+            WriteFile(
+                self.handle.raw(),
+                bounce.as_ptr(),
+                n as u32,
+                &mut written,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        if written as usize != n {
+            return Err(IoError::OutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// Run `work` on every item, spreading the items round-robin over the lanes, one thread per
+/// lane. A single item runs on the calling thread.
+fn on_lanes<T: Send>(
+    lanes: &mut [Lane],
+    items: Vec<T>,
+    work: impl Fn(&mut Lane, T) -> Result<(), IoError> + Sync,
+) -> Result<(), IoError> {
+    if items.len() <= 1 {
+        return items
+            .into_iter()
+            .try_for_each(|item| work(&mut lanes[0], item));
+    }
+    let mut groups: Vec<Vec<T>> = lanes.iter().map(|_| Vec::new()).collect();
+    let count = groups.len();
+    for (i, item) in items.into_iter().enumerate() {
+        groups[i % count].push(item);
+    }
+    let work = &work;
+    thread::scope(|scope| {
+        let running: Vec<_> = lanes
+            .iter_mut()
+            .zip(groups)
+            .filter(|(_, group)| !group.is_empty())
+            .map(|(lane, group)| {
+                scope.spawn(move || group.into_iter().try_for_each(|item| work(lane, item)))
+            })
+            .collect();
+        // Join every lane before reporting, so no I/O is still running when this returns.
+        let results: Vec<_> = running
+            .into_iter()
+            .map(|t| t.join().unwrap_or(Err(IoError::Os(-1))))
+            .collect();
+        results.into_iter().collect()
+    })
 }
 
 impl Drop for AlignedBuffer {
@@ -78,14 +200,21 @@ pub struct PhysicalDisk {
     handle: Handle,
     sector_size: u32,
     size: u64,
-    bounce: AlignedBuffer,
+    lanes: Vec<Lane>,
 }
 
 impl PhysicalDisk {
+    /// Open a test virtual disk.
     pub fn open(number: u32) -> Result<Self, PlatformError> {
-        require_virtual_disk(number)?;
+        Self::open_with(number, &WriteAccess::VirtualOnly)
+    }
+
+    /// Open any disk `access` allows (see the write guard).
+    pub fn open_with(number: u32, access: &WriteAccess) -> Result<Self, PlatformError> {
+        require_writable(number, access)?;
+        let path = format!(r"\\.\PhysicalDrive{number}");
         let handle = Handle::open(
-            &format!(r"\\.\PhysicalDrive{number}"),
+            &path,
             GENERIC_READ | GENERIC_WRITE,
             FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
         )?;
@@ -105,7 +234,27 @@ impl PhysicalDisk {
             handle,
             sector_size,
             size,
-            bounce: AlignedBuffer::new(BOUNCE_SIZE),
+            lanes: (0..LANES)
+                .map(|_| Lane::open(&path))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// An ordinary file opened like a disk, to test the parallel I/O without a real disk.
+    #[cfg(test)]
+    fn open_file_for_test(path: &str, size: u64) -> Result<Self, IoError> {
+        Ok(Self {
+            number: u32::MAX,
+            handle: Handle::open(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+            )?,
+            sector_size: 4096,
+            size,
+            lanes: (0..LANES)
+                .map(|_| Lane::open(path))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -134,6 +283,39 @@ impl PhysicalDisk {
         self.handle
             .ioctl(IOCTL_DISK_UPDATE_PROPERTIES, &[], &mut [])?;
         self.handle.flush()
+    }
+
+    /// Grow the MBR extended partition starting at `offset` to `new_length` bytes, into free
+    /// space after it. One table write; no data moves. The new end must be on a 1 MiB boundary
+    /// (or the end of the disk).
+    pub fn grow_extended(&mut self, offset: u64, new_length: u64) -> Result<(), PlatformError> {
+        const MIB: u64 = 1 << 20;
+        let mut layout = self.layout()?;
+        let Some(entry) = layout
+            .entries()
+            .into_iter()
+            .find(|e| e.offset == offset && layout.is_container(e))
+        else {
+            return Err(PlatformError::Refused(format!(
+                "no extended partition starts at byte {offset}"
+            )));
+        };
+        let end = offset
+            .checked_add(new_length)
+            .ok_or_else(|| PlatformError::Refused("length overflows".into()))?;
+        if end > self.size || (end % MIB != 0 && end != self.size) {
+            return Err(PlatformError::Refused(format!(
+                "new end {end} must be on a 1 MiB boundary inside the disk"
+            )));
+        }
+        layout.grow_container(&entry, new_length).map_err(|e| match e {
+            IoError::Os(183) => PlatformError::Refused(
+                "another partition is in the way; the extended partition can only grow into free space directly after it".into(),
+            ),
+            _ => PlatformError::Refused("only an extended partition can be grown this way, and only to a larger size".into()),
+        })?;
+        self.write_layout(&layout)?;
+        Ok(())
     }
 
     /// Refuse a move unless `[target, target + length)` is 1 MiB aligned, inside the usable
@@ -166,10 +348,14 @@ impl PhysicalDisk {
                 "target range {target}..{end} is outside the usable area {usable_start}..{usable_end}"
             )));
         }
+        // An extended partition moves with the logical drives inside it.
+        let moving_with = |e: &crate::layout::LayoutEntry| {
+            e.index == entry.index || (layout.is_container(&entry) && e.index >= 4)
+        };
         if let Some(other) = layout
             .entries()
             .into_iter()
-            .filter(|e| e.index != entry.index)
+            .filter(|e| !moving_with(e))
             .find(|e| target < e.offset + e.length && e.offset < end)
         {
             return Err(PlatformError::Refused(format!(
@@ -194,67 +380,29 @@ impl BlockDevice for PhysicalDisk {
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
         self.check_request(offset, buf.len())?;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let n = (buf.len() - done).min(BOUNCE_SIZE);
-            let mut overlapped = overlapped_at(offset + done as u64);
-            let mut read = 0u32;
-            let bounce = self.bounce.as_mut_slice();
-            #[allow(unsafe_code)]
-            // SAFETY: the bounce buffer is sector aligned and at least `n` bytes; the handle is
-            // synchronous, so OVERLAPPED only carries the offset and outlives the call.
-            let ok = unsafe {
-                ReadFile(
-                    self.handle.raw(),
-                    bounce.as_mut_ptr(),
-                    n as u32,
-                    &mut read,
-                    &mut overlapped,
-                )
-            };
-            if ok == 0 {
-                return Err(last_error());
-            }
-            if read as usize != n {
-                return Err(IoError::OutOfRange);
-            }
-            buf[done..done + n].copy_from_slice(&bounce[..n]);
-            done += n;
-        }
-        Ok(())
+        let pieces: Vec<(u64, &mut [u8])> = buf
+            .chunks_mut(PIECE)
+            .enumerate()
+            .map(|(i, piece)| (offset + (i * PIECE) as u64, piece))
+            .collect();
+        on_lanes(&mut self.lanes, pieces, |lane, (at, piece)| {
+            lane.read(at, piece)
+        })
     }
 
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
         self.check_request(offset, data.len())?;
-        let mut done = 0usize;
-        while done < data.len() {
-            let n = (data.len() - done).min(BOUNCE_SIZE);
-            let bounce = self.bounce.as_mut_slice();
-            bounce[..n].copy_from_slice(&data[done..done + n]);
-            let mut overlapped = overlapped_at(offset + done as u64);
-            let mut written = 0u32;
-            #[allow(unsafe_code)]
-            // SAFETY: as in `read_at`.
-            let ok = unsafe {
-                WriteFile(
-                    self.handle.raw(),
-                    bounce.as_ptr(),
-                    n as u32,
-                    &mut written,
-                    &mut overlapped,
-                )
-            };
-            if ok == 0 {
-                return Err(last_error());
-            }
-            if written as usize != n {
-                return Err(IoError::OutOfRange);
-            }
-            done += n;
-        }
-        Ok(())
+        let pieces: Vec<(u64, &[u8])> = data
+            .chunks(PIECE)
+            .enumerate()
+            .map(|(i, piece)| (offset + (i * PIECE) as u64, piece))
+            .collect();
+        on_lanes(&mut self.lanes, pieces, |lane, (at, piece)| {
+            lane.write(at, piece)
+        })
     }
 
+    /// Writes made through every lane reach the disk: the flush goes to the device.
     fn flush(&mut self) -> Result<(), IoError> {
         self.handle.flush()
     }
@@ -268,7 +416,7 @@ impl PartitionTable for PhysicalDisk {
     fn entry(&mut self, partition: PartitionKey) -> Result<PartitionEntry, IoError> {
         let layout = self.layout()?;
         let entry = layout.find(partition).ok_or(IoError::Os(1168))?; // ERROR_NOT_FOUND
-        Ok(layout.snapshot(&entry))
+        layout.snapshot(&entry)
     }
 
     fn detach(&mut self, partition: PartitionKey) -> Result<(), IoError> {
@@ -276,7 +424,7 @@ impl PartitionTable for PhysicalDisk {
         let Some(entry) = layout.find(partition) else {
             return Ok(());
         };
-        layout.remove(entry.index);
+        layout.remove(&entry);
         self.write_layout(&layout)
     }
 
@@ -288,7 +436,32 @@ impl PartitionTable for PhysicalDisk {
     ) -> Result<(), IoError> {
         let mut layout = self.layout()?;
         layout.insert(partition, entry, start, self.sector_size)?;
-        self.write_layout(&layout)
+        if layout.style != LayoutStyle::Mbr {
+            return self.write_layout(&layout);
+        }
+        // MBR volumes are known by disk signature + start: move their drive letters and GUIDs
+        // to the new starts before the partitions reappear (plan gap G1).
+        let records = snapshot_records(entry)?;
+        let first = records[0].offset;
+        let moves = records
+            .iter()
+            .filter(|r| r.mbr_type.is_some_and(|t| !is_extended_type(t)))
+            .map(|r| (r.offset, r.offset - first + start))
+            .filter(|(old, new)| old != new)
+            .collect::<Vec<_>>();
+        if moves.is_empty() {
+            // Back where it started (a rollback): the IDs are unchanged.
+            return self.write_layout(&layout);
+        }
+        mounted_devices::remap(&Remap {
+            signature: layout.signature(),
+            moves,
+        })?;
+        self.write_layout(&layout)?;
+        // The partitions are back, so recovery will never replay the remap. A stale plan left
+        // by a failure here only matches an identical future remap, so it is not an error.
+        let _ = mounted_devices::finish();
+        Ok(())
     }
 
     fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError> {
@@ -297,17 +470,78 @@ impl PartitionTable for PhysicalDisk {
 }
 
 impl RangeDigest for PhysicalDisk {
+    fn digest(&mut self, parts: &[&[u8]]) -> [u8; 32] {
+        crate::digest::fingerprint(parts)
+    }
+}
+
+impl PhysicalDisk {
     /// SHA-256 of a byte range, read unbuffered from the disk.
-    fn range_digest(&mut self, offset: u64, length: u64) -> Result<[u8; 32], IoError> {
+    pub fn range_digest(&mut self, offset: u64, length: u64) -> Result<[u8; 32], IoError> {
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; BOUNCE_SIZE];
+        let mut buffer = vec![0u8; LANES * PIECE];
         let mut done = 0u64;
         while done < length {
-            let n = (length - done).min(BOUNCE_SIZE as u64) as usize;
+            let n = (length - done).min(buffer.len() as u64) as usize;
             self.read_at(offset + done, &mut buffer[..n])?;
             hasher.update(&buffer[..n]);
             done += n as u64;
         }
         Ok(hasher.finalize().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_reads_and_writes_land_in_the_right_place() {
+        const MIB: usize = 1 << 20;
+        let size = 96 * MIB;
+        let path = std::env::temp_dir().join(format!("opm-lanes-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(size as u64))
+            .unwrap();
+        let mut disk =
+            PhysicalDisk::open_file_for_test(path.to_str().unwrap(), size as u64).unwrap();
+        let pattern = |i: usize, seed: usize| ((i / 4096) * 7 + i * 13 + seed) as u8;
+
+        // Spans many pieces with a partial last piece, at an offset that isn't piece aligned.
+        let data: Vec<u8> = (0..(37 * MIB + 8192)).map(|i| pattern(i, 1)).collect();
+        disk.write_at(3 * MIB as u64 + 4096, &data).unwrap();
+        disk.flush().unwrap();
+        let mut back = vec![0u8; data.len()];
+        disk.read_at(3 * MIB as u64 + 4096, &mut back).unwrap();
+        assert!(back == data, "read back differs");
+
+        // A single small request takes the one-lane path.
+        let small: Vec<u8> = (0..8192).map(|i| pattern(i, 2)).collect();
+        disk.write_at(0, &small).unwrap();
+        let mut back = vec![0u8; 8192];
+        disk.read_at(0, &mut back).unwrap();
+        assert_eq!(back, small);
+
+        // Seen through an ordinary read of the file, every byte is where it was written.
+        drop(disk);
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(&file[..8192], &small[..]);
+        assert!(file[3 * MIB + 4096..3 * MIB + 4096 + data.len()] == data[..]);
+        assert!(file[3 * MIB + 4096 + data.len()..].iter().all(|&b| b == 0));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn errors_from_any_lane_are_reported() {
+        let path = std::env::temp_dir().join(format!("opm-lanes-err-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(16 << 20))
+            .unwrap();
+        // Claims to be bigger than the file: reads past its end fail on some lane.
+        let mut disk = PhysicalDisk::open_file_for_test(path.to_str().unwrap(), 64 << 20).unwrap();
+        let mut buf = vec![0u8; 48 << 20];
+        assert!(disk.read_at(0, &mut buf).is_err());
+        drop(disk);
+        std::fs::remove_file(&path).unwrap();
     }
 }

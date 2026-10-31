@@ -64,11 +64,11 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "opm-core"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "opm-engine-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "opm-core",
  "opm-platform-win32",
@@ -76,14 +76,14 @@ dependencies = [
 
 [[package]]
 name = "opm-ffi"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "opm-core",
 ]
 
 [[package]]
 name = "opm-platform-sim"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "opm-core",
  "sha2",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "opm-platform-win32"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "opm-core",
  "sha2",

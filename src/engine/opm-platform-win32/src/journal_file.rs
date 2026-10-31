@@ -100,7 +100,9 @@ mod tests {
             direction: Direction::Backward,
             phase: Phase::Copying,
             chunks_done: 0,
+            verify: true,
             source_digest: Some([7; 32]),
+            map_digest: None,
         };
         {
             let mut journal = FileJournal::open(&path).unwrap();

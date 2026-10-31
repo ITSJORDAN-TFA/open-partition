@@ -8,6 +8,8 @@ pub enum PlatformError {
     /// A safety rule stopped the operation before anything was written.
     Refused(String),
     Move(MoveError),
+    /// The move failed and was undone: the partition is back where it started.
+    Undone(String),
 }
 
 impl fmt::Display for PlatformError {
@@ -16,6 +18,7 @@ impl fmt::Display for PlatformError {
             PlatformError::Io(e) => write!(f, "{e}"),
             PlatformError::Refused(why) => write!(f, "refused: {why}"),
             PlatformError::Move(e) => write!(f, "{e}"),
+            PlatformError::Undone(why) => f.write_str(why),
         }
     }
 }
