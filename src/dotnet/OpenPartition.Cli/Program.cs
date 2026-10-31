@@ -226,15 +226,23 @@ async Task<int> ResumeAsync(bool undo)
         }
         var name = verdict == WriteVerdict.NeedsSnapshot ? snapshotName : null;
         var progress = new Progress<StepProgress>(p => Console.WriteLine(p.Fraction is { } f ? $"  {f:P0}  {p.Text}" : $"  {p.Text}"));
-        if (undo)
+        try
         {
-            await Engine.UndoAsync(move, disk.Number, name, progress);
-            Console.WriteLine("Undone: the partition is back where it was.");
+            if (undo)
+            {
+                await Engine.UndoAsync(move, disk.Number, name, progress);
+                Console.WriteLine("Undone: the partition is back where it was.");
+            }
+            else
+            {
+                await Engine.RecoverAsync(move, disk.Number, name, progress);
+                Console.WriteLine("Finished.");
+            }
         }
-        else
+        catch (OperationFailedException e)
         {
-            await Engine.RecoverAsync(move, disk.Number, name, progress);
-            Console.WriteLine("Finished.");
+            Console.Error.WriteLine($"error: {VolumeUsers.Explain(e.Message, snapshot)}");
+            return 1;
         }
     }
     return 0;
