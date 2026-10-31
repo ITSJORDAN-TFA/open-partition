@@ -210,35 +210,45 @@ internal static class Dialogs
             stopButton.Content = "Stopping after this step…";
         };
         ((Panel)ok.Parent).Children.Insert(0, stopButton);
-        ok.Click += async (_, _) =>
+        var retry = new ServiceRetry(ok);
+
+        // From step <start> on: the first run starts at 0, a retry after stopping services at
+        // the step that failed (the ones before it are done).
+        async Task Run(int start)
         {
             running = true;
+            stop = false;
             ok.IsEnabled = false;
             cancel.IsEnabled = false;
-            stopButton.Visibility = steps.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+            stopButton.IsEnabled = true;
+            stopButton.Content = "Stop after this step";
+            stopButton.Visibility = steps.Count - start > 1 ? Visibility.Visible : Visibility.Collapsed;
             snapshotName.IsEnabled = false;
             confirm.IsEnabled = false;
             bar.Visibility = Visibility.Visible;
+            status.Foreground = Brushes.Black;
             var progress = new Progress<(int Index, StepProgress Progress)>(p =>
             {
+                var index = start + p.Index;
                 for (var i = 0; i < stepTexts.Count; i++)
                 {
-                    stepTexts[i].FontWeight = i == p.Index ? FontWeights.SemiBold : FontWeights.Normal;
+                    stepTexts[i].FontWeight = i == index ? FontWeights.SemiBold : FontWeights.Normal;
                 }
                 bar.IsIndeterminate = p.Progress.Fraction is null;
                 if (p.Progress.Fraction is { } f)
                 {
                     bar.Value = f;
                 }
-                status.Text = $"Step {p.Index + 1} of {steps.Count}: {p.Progress.Text}";
+                status.Text = $"Step {index + 1} of {steps.Count}: {p.Progress.Text}";
             });
-            var result = await Executor.RunAsync(snapshot, steps, needsSnapshot ? snapshotName.Text.Trim() : null, progress, stopRequested: () => stop);
+            var result = await Executor.RunAsync(snapshot, steps.Skip(start).ToList(), needsSnapshot ? snapshotName.Text.Trim() : null, progress, stopRequested: () => stop);
+            var completed = start + result.Completed;
             running = false;
             stopButton.Visibility = Visibility.Collapsed;
             bar.IsIndeterminate = false;
             if (result.Stopped)
             {
-                status.Text = $"Stopped as asked: steps 1 to {result.Completed} are done, the rest were not started.";
+                status.Text = $"Stopped as asked: steps 1 to {completed} are done, the rest were not started.";
                 status.Foreground = Palette.Info;
             }
             else if (result.Succeeded)
@@ -249,12 +259,16 @@ internal static class Dialogs
             }
             else
             {
-                status.Text = $"Step {result.Completed + 1} failed: {result.Error}" + (result.Completed > 0 ? $" Steps 1 to {result.Completed} are done; the rest were not started." : "");
+                var error = result.Lock is { } users ? VolumeUsers.Format(users, StopHint.Button) : result.Error;
+                status.Text = $"Step {completed + 1} failed: {error}" + (completed > 0 ? $" Steps 1 to {completed} are done; the rest were not started." : "");
                 status.Foreground = Palette.Blocker;
+                retry.Offer(window, status, result.Lock, () => Run(completed));
             }
             cancel.Content = "Close";
             cancel.IsEnabled = true;
-        };
+        }
+
+        ok.Click += async (_, _) => await Run(0);
         window.ShowDialog();
         await Task.CompletedTask.ConfigureAwait(true);
     }
@@ -287,7 +301,9 @@ internal static class Dialogs
         ok.IsEnabled = verdict == WriteVerdict.Allowed || verdict == WriteVerdict.NeedsSnapshot;
         var running = false;
         window.Closing += (_, e) => e.Cancel = running;
-        ok.Click += async (_, _) =>
+        var retry = new ServiceRetry(ok);
+
+        async Task Run()
         {
             if (verdict == WriteVerdict.NeedsSnapshot && snapshotName.Text.Trim().Length == 0)
             {
@@ -297,6 +313,7 @@ internal static class Dialogs
             running = true;
             ok.IsEnabled = cancel.IsEnabled = false;
             bar.Visibility = Visibility.Visible;
+            status.Foreground = Brushes.Black;
             try
             {
                 var name = verdict == WriteVerdict.NeedsSnapshot ? snapshotName.Text.Trim() : null;
@@ -322,15 +339,80 @@ internal static class Dialogs
             catch (OperationFailedException e)
             {
                 bar.IsIndeterminate = false;
-                status.Text = (undo ? "Could not undo the move: " : "Could not finish the move: ") + VolumeUsers.Explain(e.Message, snapshot)
+                status.Text = "Checking what is using the volume…";
+                var message = e.Message;
+                var users = await Task.Run(() => VolumeUsers.Diagnose(message, snapshot));
+                status.Text = (undo ? "Could not undo the move: " : "Could not finish the move: ") + (users is null ? message : VolumeUsers.Format(users, StopHint.Button))
                     + (!undo && pending.Move.CanUndo ? " You can Undo the move instead: the partition goes back where it was." : "");
                 status.Foreground = Palette.Blocker;
+                retry.Offer(window, status, users, Run);
             }
             running = false;
             cancel.Content = "Close";
             cancel.IsEnabled = true;
-        };
+        }
+
+        ok.Click += async (_, _) => await Run();
         window.ShowDialog();
+    }
+
+    /// <summary>
+    /// The "Stop service X and retry" button, left of <c>ok</c> and hidden until a lock failure
+    /// names services that can be stopped. It asks first, stops only those services (and the
+    /// services that depend on them), then retries. It never stops a process.
+    /// </summary>
+    private sealed class ServiceRetry
+    {
+        private readonly Button button = new() { Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(0, 0, 8, 0), Visibility = Visibility.Collapsed };
+        private IReadOnlyList<ServiceUser> services = [];
+        private Func<Task>? again;
+        private Window? window;
+        private TextBlock? status;
+
+        public ServiceRetry(Button ok)
+        {
+            ((Panel)ok.Parent).Children.Insert(0, button);
+            button.Click += async (_, _) => await StopAndRetryAsync();
+        }
+
+        public void Offer(Window owner, TextBlock text, LockDiagnosis? users, Func<Task> retry)
+        {
+            services = users?.StoppableServices ?? [];
+            window = owner;
+            status = text;
+            again = retry;
+            button.Content = services.Count > 0 ? VolumeUsers.StopButtonText(services) : "";
+            button.Visibility = services.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private async Task StopAndRetryAsync()
+        {
+            if (window is null || status is null || again is null || services.Count == 0)
+            {
+                return;
+            }
+            var title = button.Content as string ?? "Stop services";
+            if (MessageBox.Show(window, VolumeUsers.StopConfirmation(services), title, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+            {
+                return;
+            }
+            var stopped = services;
+            button.Visibility = Visibility.Collapsed;
+            status.Foreground = Brushes.Black;
+            try
+            {
+                await ServiceControl.StopAsync(stopped, new Progress<string>(t => status.Text = t));
+            }
+            catch (Exception e) when (e is OperationFailedException or System.Management.ManagementException or UnauthorizedAccessException or System.Runtime.InteropServices.COMException)
+            {
+                status.Text = e.Message;
+                status.Foreground = Palette.Blocker;
+                button.Visibility = Visibility.Visible;
+                return;
+            }
+            await again();
+            status.Text += $" Stopped for this: {string.Join(", ", stopped.Select(s => s.DisplayName))}. Start {(stopped.Count == 1 ? "it" : "them")} again from Services (services.msc) when you are ready.";
+        }
     }
 
     private static T? Show<T>(Window owner, string title, UIElement body, string okText, Func<T> create, double width = 560) where T : class
