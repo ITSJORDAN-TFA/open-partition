@@ -118,7 +118,7 @@ impl PartitionTable for TableDisk {
         }))
     }
 
-    fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError> {
+    fn range_is_free(&mut self, _: PartitionKey, start: u64, length: u64) -> Result<bool, IoError> {
         Ok(self
             .row()?
             .is_none_or(|r| r.start + r.length <= start || start + length <= r.start))
@@ -766,8 +766,8 @@ impl PartitionTable for BusyDisk {
     fn attach(&mut self, p: PartitionKey, e: &PartitionEntry, start: u64) -> Result<(), IoError> {
         self.inner.attach(p, e, start)
     }
-    fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError> {
-        self.inner.range_is_free(start, length)
+    fn range_is_free(&mut self, p: PartitionKey, start: u64, length: u64) -> Result<bool, IoError> {
+        self.inner.range_is_free(p, start, length)
     }
 }
 

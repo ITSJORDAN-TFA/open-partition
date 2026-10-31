@@ -16,7 +16,10 @@ pub const RECORD_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"OPMJRNL\0";
 /// Bump when the record layout changes. Older engines refuse newer journals instead of
 /// misreading them.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
+/// Oldest version still read. Version 5 kept the record layout of 4; it marks journals that
+/// may hold a logical-drive move, which an older engine must not resume.
+const OLDEST_READABLE_VERSION: u16 = 4;
 
 const CRC_OFFSET: usize = RECORD_SIZE - 4;
 const ENTRY_OFFSET: usize = 176;
@@ -159,7 +162,7 @@ impl MoveRecord {
             return Err(DecodeError::Invalid);
         }
         let version = u16_at(8);
-        if version != FORMAT_VERSION {
+        if !(OLDEST_READABLE_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let phase = match buf[10] {
@@ -385,5 +388,19 @@ mod tests {
             MoveRecord::decode(&buf),
             Err(DecodeError::UnsupportedVersion(99))
         );
+    }
+
+    #[test]
+    fn version_4_still_loads_and_older_is_refused() {
+        let reencode = |version: u16| {
+            let mut buf = [0u8; RECORD_SIZE];
+            sample().encode(&mut buf);
+            buf[8..10].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32(&buf[..CRC_OFFSET]);
+            buf[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+            MoveRecord::decode(&buf)
+        };
+        assert_eq!(reencode(4), Ok(sample()));
+        assert_eq!(reencode(3), Err(DecodeError::UnsupportedVersion(3)));
     }
 }

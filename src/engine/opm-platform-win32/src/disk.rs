@@ -12,7 +12,9 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::guard::{require_writable, WriteAccess};
 use crate::handle::{last_error, Handle, GENERIC_READ, GENERIC_WRITE};
-use crate::layout::{is_extended_type, snapshot_records, Layout, LayoutStyle};
+use crate::layout::{
+    insert_and_write_ebr, is_extended_type, snapshot_records, Layout, LayoutStyle,
+};
 use crate::mounted_devices::{self, Remap};
 use crate::PlatformError;
 
@@ -348,6 +350,19 @@ impl PhysicalDisk {
                 "target range {target}..{end} is outside the usable area {usable_start}..{usable_end}"
             )));
         }
+        if layout.is_logical(&entry) {
+            // Try it on a copy of the table: out of the chain, then back in at the target.
+            let mut trial = layout.clone();
+            let snapshot = trial.snapshot(&entry)?;
+            trial.remove(&entry);
+            return trial
+                .insert(key, &snapshot, target, self.sector_size)
+                .map_err(|_| {
+                    PlatformError::Refused(format!(
+                        "a logical drive can only move inside its extended partition, into free space between its neighbours, with room for its EBR before it; {target}..{end} isn't such a place"
+                    ))
+                });
+        }
         // An extended partition moves with the logical drives inside it.
         let moving_with = |e: &crate::layout::LayoutEntry| {
             e.index == entry.index || (layout.is_container(&entry) && e.index >= 4)
@@ -435,7 +450,7 @@ impl PartitionTable for PhysicalDisk {
         start: u64,
     ) -> Result<(), IoError> {
         let mut layout = self.layout()?;
-        layout.insert(partition, entry, start, self.sector_size)?;
+        insert_and_write_ebr(self, &mut layout, partition, entry, start)?;
         if layout.style != LayoutStyle::Mbr {
             return self.write_layout(&layout);
         }
@@ -464,8 +479,13 @@ impl PartitionTable for PhysicalDisk {
         Ok(())
     }
 
-    fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError> {
-        Ok(self.layout()?.range_is_free(start, length))
+    fn range_is_free(
+        &mut self,
+        partition: PartitionKey,
+        start: u64,
+        length: u64,
+    ) -> Result<bool, IoError> {
+        Ok(self.layout()?.range_is_free_for(partition, start, length))
     }
 }
 
