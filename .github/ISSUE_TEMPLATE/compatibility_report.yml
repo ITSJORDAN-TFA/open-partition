@@ -1,0 +1,45 @@
+name: Compatibility report
+description: Share the self-test result from your machine (it only uses throwaway test disks)
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `Test-OpmOnThisMachine.ps1` from the release zip in an elevated PowerShell. It creates small throwaway VHDX disks, moves partitions on them and deletes them; it never writes to your real disks. Then attach the `report-*.zip` it makes.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows Server 2022 Datacenter (build 20348)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Machine
+      description: Cloud and VM size, hypervisor, or hardware.
+      placeholder: Azure Standard_D4s_v5, Gen2
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - All checks passed
+        - Some checks failed
+        - The self-test didn't run
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: Drag the report zip here, or paste summary.txt.
+    validations:
+      required: true

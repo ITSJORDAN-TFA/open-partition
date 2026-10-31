@@ -2,14 +2,46 @@
 
 <img src="assets/brand/open-partition-128.png" alt="" width="96" align="right" />
 
-A free, open-source tool for Windows Server administrators to view, resize and move partitions,
-including on Azure VMs.
+**Free, open-source partition manager for Windows Server and Azure VMs.** Move partitions out of
+the way and extend C: (or any NTFS volume) into the free space, crash-safely, with a GUI and a
+scriptable CLI. MIT licensed; no trial limits and no paid "Server edition".
+
+It fixes the classic **"Extend Volume is greyed out"** problem in Disk Management: Windows can only
+extend a volume into unallocated space *directly after it*. When a recovery partition, another
+data partition or an MBR extended partition sits in the way, Open Partition Manager moves it
+aside (keeping drive letters and volume GUIDs) so the volume can grow.
 
 > **Status: preview.** The GUI and `opm` show disks, partitions, free space and everything the
 > tool would refuse or warn about, and can move partitions (crash-safely, journaled) and extend
 > volumes. Writes are limited to test virtual disks (VHD/VHDX) and, after a snapshot, real disks
 > on Azure VMs; see the [compatibility matrix](#compatibility-matrix). See [`.spec/plan.md`](.spec/plan.md) for the
 > plan and [`.spec/handover.md`](.spec/handover.md) for the original brief.
+
+## A free alternative to commercial partition tools
+
+Windows Server admins usually reach for paid tools to move a partition or extend the system
+drive. Open Partition Manager is a free, open-source alternative to:
+
+- AOMEI Partition Assistant (Server / Unlimited editions)
+- MiniTool Partition Wizard (Server edition)
+- EaseUS Partition Master (Server edition)
+- Paragon Partition Manager / Hard Disk Manager for Server
+- NIUBI Partition Editor (Server edition)
+- IM-Magic Partition Resizer (Server edition)
+- Macrorit Partition Expert (Server edition)
+
+It also covers what Windows' own **Disk Management**, **diskpart** and **`Resize-Partition`**
+can't do: move partitions, and grow an MBR extended partition so its last logical drive can be
+extended. It currently moves and extends, and doesn't do everything those tools do yet
+(shrink, clone, convert MBR↔GPT and moving the Windows partition are on the
+[plan](.spec/plan.md)). Product names are trademarks of their owners; this project isn't
+affiliated with any of them.
+
+**Common searches this answers:** extend C drive on Windows Server · Extend Volume greyed out ·
+unallocated space not next to C: · move recovery partition to extend C · resize partition on an
+Azure VM · extend OS disk after resizing in the Azure portal · move partition Windows Server 2016 /
+2019 / 2022 / 2025 · extend logical drive in an MBR extended partition · free partition manager
+for Windows Server.
 
 ## Download
 
@@ -151,3 +183,7 @@ Run from an elevated prompt; without elevation BitLocker status is unknown and m
 
 To try the engine safely on any machine, run `Test-OpmOnThisMachine.ps1` from the preview
 package. It builds throwaway VHDX disks, moves partitions on them, and deletes them afterwards.
+
+## Contributing
+
+Issues, compatibility reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: this tool writes raw disk sectors, so changes to how it writes need crash-campaign and VHDX tests. Report security problems privately ([SECURITY.md](SECURITY.md)). Everyone follows the [code of conduct](CODE_OF_CONDUCT.md).
