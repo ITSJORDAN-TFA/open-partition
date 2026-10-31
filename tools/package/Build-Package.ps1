@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 <#
 .SYNOPSIS
-    Builds the self-contained preview package: artifacts/opm-preview-<version>-win-x64.zip.
+    Builds the self-contained package: artifacts/openpartition-<version>-win-x64.zip (and .sha256).
 
 .DESCRIPTION
     - opm-engine.exe: Rust release build with the C runtime linked statically, so it runs
@@ -11,17 +11,21 @@
     - README.txt and Test-OpmOnThisMachine.ps1 from this folder.
 #>
 param(
-    [string] $Runtime = 'win-x64'
+    [string] $Runtime = 'win-x64',
+    # Defaults to the version in ProductInfo.cs; CI passes e.g. 0.1.0-preview.42 for main builds.
+    [string] $Version
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
-$version = ([regex]::Match((Get-Content (Join-Path $root 'src/dotnet/OpenPartition.Model/ProductInfo.cs') -Raw), 'Version = "([^"]+)"')).Groups[1].Value
-$name = "opm-preview-$version-$Runtime"
+$version = if ($Version) { $Version } else { ([regex]::Match((Get-Content (Join-Path $root 'src/dotnet/OpenPartition.Model/ProductInfo.cs') -Raw), 'Version = "([^"]+)"')).Groups[1].Value }
+$name = "openpartition-$version-$Runtime"
 $artifacts = Join-Path $root 'artifacts'
-$stage = Join-Path $artifacts $name
-$zip = "$stage.zip"
+# Stage outside artifacts/, so the unzipped folder is never run in place by mistake.
+$stage = Join-Path ([System.IO.Path]::GetTempPath()) $name
+$zip = Join-Path $artifacts "$name.zip"
+New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
 
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
