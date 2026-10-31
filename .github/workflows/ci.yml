@@ -94,7 +94,7 @@ jobs:
       group: preview-release
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.package }}
           path: dist
@@ -118,7 +118,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.package }}
           path: dist
