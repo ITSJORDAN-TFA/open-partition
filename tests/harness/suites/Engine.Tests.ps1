@@ -574,3 +574,50 @@ function Test-OpmGrowsLastLogicalDrive {
         Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
     }
 }
+
+function Test-LockFailureNamesTheProgramHoldingAFile {
+    <#
+        A program elsewhere holds a file open on the volume, so the engine can't lock it. The
+        move must be refused with the disk untouched, and the message must name that program
+        (process id and the file). The holder is a child of this test, stopped at the end; no
+        service is touched.
+    #>
+    Assert-EngineHost
+    $layout = 'gpt-512n-single'
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $path = Join-Path $env:OPM_HARNESS_OUT "lock-$layout-$id.vhdx"
+    $holder = $null
+    try {
+        $null = New-TestDisk -Layout $layout -Path $path -Seed 19
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        $before = Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label 'DATA1'
+        $file = Join-Path $before.Volume.Path 'held-open.txt'
+
+        $script = "`$f = [IO.File]::Open('$file', 'OpenOrCreate', 'ReadWrite', 'None'); Start-Sleep -Seconds 300"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        $holder = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -PassThru -WindowStyle Hidden
+        $deadline = (Get-Date).AddSeconds(30)
+        $held = $false
+        while (-not $held -and (Get-Date) -lt $deadline -and -not $holder.HasExited) {
+            try { [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite').Dispose(); Start-Sleep -Milliseconds 200 }
+            catch [System.IO.FileNotFoundException] { Start-Sleep -Milliseconds 200 }
+            catch { $held = $true }
+        }
+        if (-not $held) { throw 'The test program did not get the file open.' }
+
+        $r = Invoke-Opm @('move', $vhd.DiskNumber, "@$($before.Partition.Offset)", '--to', 144MB, '--yes')
+        $text = $r.Output -join "`n"
+        if ($r.ExitCode -eq 0) { throw "The move ran although a file was open on the volume: $text" }
+        if ($text -notmatch 'is in use, so it can''t be locked') { throw "Not reported as a lock failure: $text" }
+        if ($text -notmatch "process $($holder.Id)\)") { throw "The program holding the file (process $($holder.Id)) is not named: $text" }
+        if ($text -notmatch 'held-open\.txt') { throw "The open file is not named: $text" }
+        if ($text -notmatch 'Nothing was changed') { throw "The message does not say nothing changed: $text" }
+        $after = (Get-Partition -DiskNumber $vhd.DiskNumber | Where-Object Guid -eq $before.Partition.Guid)
+        if ($after.Offset -ne $before.Partition.Offset) { throw 'The partition moved although the move was refused.' }
+    }
+    finally {
+        if ($holder -and -not $holder.HasExited) { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+        Dismount-VHD -Path $path -ErrorAction SilentlyContinue
+        Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
+    }
+}
