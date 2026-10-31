@@ -3,7 +3,10 @@
 # SectorFormat: 512n (512 logical / 512 physical), 512e (512 / 4096) or 4Kn (4096 / 4096).
 # Partitions are created in order. Offset (MiB) is optional; without it a partition follows
 # the previous one. Size 0 means "use the rest of the disk". FillPercent controls how much
-# deterministic test data is written to the volume.
+# deterministic test data is written to the volume. On MBR, Kind = 'Extended' makes an
+# extended partition (no file system) and Kind = 'Logical' a logical drive inside the extended
+# partition before it; Windows puts 64 KiB of chain overhead before each logical drive.
+# Keep at least ~40 MiB free on small volumes: Repair-Volume -Scan needs room for a snapshot.
 #
 # Kept small on purpose: every integration run builds, fills, moves and re-reads these, and
 # the shapes (overlap, alignment, sector size, table style) matter, not the size. GPT disks
@@ -82,6 +85,21 @@
             @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'LEFT';   FillPercent = 50 }
             @{ SizeMB = 384; FileSystem = 'NTFS'; Label = 'TARGET'; FillPercent = 80 }
             @{ SizeMB = 256; FileSystem = 'NTFS'; Label = 'RIGHT';  FillPercent = 50 }
+        )
+    }
+
+    'mbr-512n-logical-boxed-in' = @{
+        Description  = 'The Azure field case in miniature: SYS is boxed in by a primary and an extended partition holding three logical drives, with the free space at the end of the disk.'
+        Style        = 'MBR'
+        SectorFormat = '512n'
+        DiskSizeMB   = 1024
+        Partitions   = @(
+            @{ SizeMB = 160; FileSystem = 'NTFS'; Label = 'SYS';  FillPercent = 50 }
+            @{ SizeMB = 96;  FileSystem = 'NTFS'; Label = 'PRIM'; FillPercent = 40 }
+            @{ Kind = 'Extended'; SizeMB = 320 }
+            @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG1'; FillPercent = 45 }
+            @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG2'; FillPercent = 40 }
+            @{ Kind = 'Logical'; SizeMB = 96; FileSystem = 'NTFS'; Label = 'LOG3'; FillPercent = 45 }
         )
     }
 }

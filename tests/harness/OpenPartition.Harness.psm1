@@ -61,22 +61,37 @@ function Test-LayoutDefinition {
     if (-not $script:SectorFormats.ContainsKey($Layout.SectorFormat)) {
         $problems.Add("unknown SectorFormat '$($Layout.SectorFormat)'")
     }
-    if ($Layout.Style -eq 'MBR' -and $Layout.Partitions.Count -gt 4) {
+    $kinds = @($Layout.Partitions | ForEach-Object { if ($_.ContainsKey('Kind')) { $_.Kind } else { 'Primary' } })
+    if ($Layout.Style -eq 'MBR' -and @($kinds | Where-Object { $_ -ne 'Logical' }).Count -gt 4) {
         $problems.Add('MBR layouts are limited to 4 primary partitions')
     }
+    if ($Layout.Style -ne 'MBR' -and @($kinds | Where-Object { $_ -ne 'Primary' }).Count) {
+        $problems.Add('extended and logical partitions need an MBR layout')
+    }
+    $extendedEnd = $null
     # Initialize-Disk adds a 16 MiB Microsoft Reserved partition to GPT disks.
     $cursor = if ($Layout.Style -eq 'GPT') { 16 } else { 1 }
     # Leave room for the backup GPT (or nothing for MBR) at the end of the disk.
     $usable = $Layout.DiskSizeMB - 1
     for ($i = 0; $i -lt $Layout.Partitions.Count; $i++) {
         $p = $Layout.Partitions[$i]
+        if ($kinds[$i] -eq 'Logical') {
+            # Inside the extended partition: 1 MiB covers the chain overhead and alignment.
+            if ($null -eq $extendedEnd) { $problems.Add("logical partition $i has no extended partition before it"); continue }
+            $cursor += 1 + $p.SizeMB
+            if ($cursor -gt $extendedEnd) { $problems.Add("logical partition $i does not fit in its extended partition") }
+            if ($p.FillPercent -lt 0 -or $p.FillPercent -gt 95) { $problems.Add("partition $i FillPercent must be 0-95") }
+            continue
+        }
+        if ($null -ne $extendedEnd) { $cursor = $extendedEnd; $extendedEnd = $null }
         $start = if ($p.ContainsKey('OffsetMB')) { $p.OffsetMB } else { $cursor }
         if ($start -lt $cursor) { $problems.Add("partition $i overlaps the one before it") }
         $size = if ($p.SizeMB -eq 0) { $usable - $start } else { $p.SizeMB }
         if ($size -le 0 -or $start + $size -gt $usable) { $problems.Add("partition $i does not fit on the disk") }
         if ($p.SizeMB -eq 0 -and $i -ne $Layout.Partitions.Count - 1) { $problems.Add('only the last partition may use SizeMB = 0') }
-        if ($p.FillPercent -lt 0 -or $p.FillPercent -gt 95) { $problems.Add("partition $i FillPercent must be 0-95") }
+        if ($p.ContainsKey('FillPercent') -and ($p.FillPercent -lt 0 -or $p.FillPercent -gt 95)) { $problems.Add("partition $i FillPercent must be 0-95") }
         $cursor = $start + $size
+        if ($kinds[$i] -eq 'Extended') { $extendedEnd = $cursor; $cursor = $start }
     }
     return $problems
 }
@@ -241,13 +256,23 @@ function New-TestDisk {
             # Initialize-Disk may add an MSR on GPT; place each partition after whatever exists.
             $existingEnd = (Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue |
                 ForEach-Object { $_.Offset + $_.Size } | Measure-Object -Maximum).Maximum
+            if (-not $existingEnd) { $existingEnd = 0 }
             $cursor = [Math]::Max([long]$existingEnd, $script:MiB)
             $cursor = [long]([Math]::Ceiling($cursor / $script:MiB) * $script:MiB)
             $offset = if ($p.ContainsKey('OffsetMB')) { [long]$p.OffsetMB * $script:MiB } else { $cursor }
             if ($offset -lt $cursor) { throw "Partition $index of '$Layout' would overlap an existing partition." }
 
-            $newPartition = @{ DiskNumber = $diskNumber; Offset = $offset }
+            $kind = if ($p.ContainsKey('Kind')) { $p.Kind } else { 'Primary' }
+            $newPartition = @{ DiskNumber = $diskNumber }
+            if ($kind -ne 'Logical') { $newPartition.Offset = $offset }
             if ($p.SizeMB -eq 0) { $newPartition.UseMaximumSize = $true } else { $newPartition.Size = [long]$p.SizeMB * $script:MiB }
+            if ($kind -eq 'Extended') {
+                New-Partition @newPartition -MbrType Extended | Out-Null
+                $index++
+                continue
+            }
+            # With an extended partition on the disk, a partition created without an offset
+            # becomes the next logical drive inside it.
             $partition = New-Partition @newPartition
             $partition | Format-Volume -FileSystem $p.FileSystem -NewFileSystemLabel $p.Label -Confirm:$false | Out-Null
 

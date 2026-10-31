@@ -1,12 +1,16 @@
-<#
+﻿<#
 .SYNOPSIS
     Open Partition Manager preview - self-test for a server or Azure VM.
 
 .DESCRIPTION
     1. Read-only: records what `opm list` / `opm show` see on this machine (all disks).
-    2. Engine self-test: creates a small throwaway VHDX with diskpart (no Hyper-V needed),
-       moves a partition on it, kills a second move part way and recovers it, and checks every
-       file byte for byte plus a file system scan. The VHDX is deleted afterwards.
+    2. Engine self-test: creates small throwaway VHDX disks with diskpart (no Hyper-V needed),
+       moves a partition, kills a second move part way and recovers it, and checks every file
+       byte for byte plus a file system scan. A third round builds this VM's own shape on MBR
+       (a boxed-in system partition followed by a primary and an extended partition with
+       logical drives), moves the extended partition and the primary to the end, extends the
+       first partition with Resize-Partition, and checks files, volume GUIDs and drive letters.
+       The VHDX files are deleted afterwards.
 
     Nothing here writes to this machine's real disks. opm-engine refuses to open any disk
     that is not a VHD/VHDX, and this script only points it at the VHDX it created.
@@ -19,10 +23,17 @@
 
 .PARAMETER SkipEngineTest
     Only run the read-only discovery part.
+
+.PARAMETER RollbackOnly
+    Only run the two rollback rounds: an extended partition moved far right whose finished
+    copy fails the final hash check must stay out of the table, `compare` must find the bad
+    sector, and `rollback` must put every logical drive back exactly as it was; and a move
+    during which something writes into the source must stop and undo itself.
 #>
 param(
     [string] $WorkDir = (Join-Path $PSScriptRoot 'selftest-work'),
-    [switch] $SkipEngineTest
+    [switch] $SkipEngineTest,
+    [switch] $RollbackOnly
 )
 
 Set-StrictMode -Version 2
@@ -260,7 +271,10 @@ function Test-MoveRound([string] $Name, [bool] $Kill) {
         else {
             $r = Invoke-Native $engine $moveArgs
             if ($r.ExitCode -ne 0) { throw "move failed: $(($r.Output -split "`n" | Where-Object { $_ -notlike 'progress*' }) -join ' ')" }
-            $detail = "moved $([Math]::Round(($to - $from) / 1MB, 2)) MiB right (from offset $from)"
+            $copyBytes = if ($r.Output -match 'copy_bytes=(\d+)') { [long]$Matches[1] } else { 0 }
+            # The volume is 60% full: its free space must be skipped, not copied.
+            if ($copyBytes -ge $partition.Size) { throw "free space was not skipped: copied $copyBytes of $($partition.Size) bytes ($(($r.Output -split "`n" | Where-Object { $_ -like 'locked=*' }) -join ' '))" }
+            $detail = "moved $([Math]::Round(($to - $from) / 1MB, 2)) MiB right (from offset $from), copying $([Math]::Round($copyBytes / 1MB)) MiB of $([Math]::Round($partition.Size / 1MB)) MiB"
         }
         $seconds = [Math]::Round(((Get-Date) - $start).TotalSeconds, 1)
 
@@ -280,7 +294,295 @@ function Test-MoveRound([string] $Name, [bool] $Kill) {
     }
     finally {
         Remove-SelfTestDisk $vhdx
+        Remove-Item $journal, "$journal.log", "$journal.map" -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-FreeDriveLetter {
+    $used = @(Get-PSDrive -PSProvider FileSystem | ForEach-Object Name) + @(Get-Volume | Where-Object DriveLetter | ForEach-Object { [string]$_.DriveLetter })
+    foreach ($c in 'PQRSTUVWXYZ'.ToCharArray()) { if ([string]$c -notin $used) { return [string]$c } }
+    throw 'No free drive letter for the test.'
+}
+
+function Find-Labelled([int] $DiskNumber, [string] $Label) {
+    foreach ($p in Get-Partition -DiskNumber $DiskNumber) {
+        $v = $p | Get-Volume -ErrorAction SilentlyContinue
+        if ($v -and $v.FileSystemLabel -eq $Label) { return [pscustomobject] @{ Partition = $p; Volume = $v } }
+    }
+    throw "No volume labelled $Label on disk $DiskNumber."
+}
+
+# A throwaway MBR VHDX shaped like this VM's disk: OPMSYS, OPMPRIM, then an extended partition
+# (at 225 MiB, 320 MiB long) with three logical drives, each holding test files.
+function New-MbrShapeDisk([string] $vhdx) {
+        $existing = @(Get-Disk | ForEach-Object Number)
+        Invoke-DiskPart @("create vdisk file=`"$vhdx`" maximum=1024 type=expandable", "select vdisk file=`"$vhdx`"", 'attach vdisk') | Out-Null
+        $disk = $null
+        foreach ($i in 1..20) {
+            Start-Sleep -Milliseconds 500
+            $disk = Get-Disk | Where-Object { $_.Number -notin $existing -and $_.BusType -eq 'File Backed Virtual' } | Select-Object -First 1
+            if ($disk) { break }
+        }
+        if (-not $disk) { throw 'Attached VHDX did not appear as a disk.' }
+        $number = $disk.Number
+        Initialize-Disk -Number $number -PartitionStyle MBR
+        $volumes = @(
+            @{ Label = 'OPMSYS'; Size = 128MB }, @{ Label = 'OPMPRIM'; Size = 96MB },
+            @{ Label = 'OPMLOG1'; Size = 96MB }, @{ Label = 'OPMLOG2'; Size = 96MB }, @{ Label = 'OPMLOG3'; Size = 96MB }
+        )
+        New-Partition -DiskNumber $number -Offset 1MB -Size 128MB | Format-Volume -FileSystem NTFS -NewFileSystemLabel OPMSYS -Confirm:$false | Out-Null
+        New-Partition -DiskNumber $number -Offset 129MB -Size 96MB | Format-Volume -FileSystem NTFS -NewFileSystemLabel OPMPRIM -Confirm:$false | Out-Null
+        New-Partition -DiskNumber $number -Offset 225MB -Size 320MB -MbrType Extended | Out-Null
+        foreach ($label in 'OPMLOG1', 'OPMLOG2', 'OPMLOG3') {
+            New-Partition -DiskNumber $number -Size 96MB | Format-Volume -FileSystem NTFS -NewFileSystemLabel $label -Confirm:$false | Out-Null
+        }
+        $seed = 100
+        foreach ($v in $volumes) {
+            $v.Seed = $seed; $seed++
+            $v.Bytes = [long]($v.Size * 0.35)
+            $found = Find-Labelled $number $v.Label
+            $mount = Join-Path $WorkDir "mnt-$($v.Label)"
+            New-Item -ItemType Directory -Path $mount -Force | Out-Null
+            $found.Partition | Add-PartitionAccessPath -AccessPath $mount
+            Write-TestData -Root $mount -TargetBytes $v.Bytes -Seed $v.Seed
+            $found.Partition | Remove-PartitionAccessPath -AccessPath $mount
+            Remove-Item $mount -Force
+            $v.Path = $found.Volume.Path
+        }
+        return [pscustomobject] @{ Number = $number; Volumes = $volumes }
+}
+
+function Test-ExtendedRound([string] $Name) {
+    $vhdx = Join-Path $WorkDir "opm-selftest-$([guid]::NewGuid().ToString('N').Substring(0, 8)).vhdx"
+    $journal = "$vhdx.journal"
+    $letters = @{}
+    try {
+        $shape = New-MbrShapeDisk $vhdx
+        $number = $shape.Number
+        $volumes = $shape.Volumes
+        # A Remote Desktop client on this machine redirects new drive letters into its sessions
+        # and holds them open, so lettered test volumes could not be locked. Skip letters then.
+        $rdp = [bool](Get-Process msrdc, mstsc -ErrorAction SilentlyContinue)
+        foreach ($label in @(if (-not $rdp) { 'OPMPRIM', 'OPMLOG2' })) {
+            $letter = Get-FreeDriveLetter
+            (Find-Labelled $number $label).Partition | Set-Partition -NewDriveLetter $letter
+            $letters[$label] = $letter
+        }
+
+        $start = Get-Date
+        $shift = 256MB
+        $extended = Get-Partition -DiskNumber $number | Where-Object Type -eq 'Extended'
+        $primary = (Find-Labelled $number 'OPMPRIM').Partition
+        foreach ($m in @(@{ What = 'extended partition'; From = $extended.Offset; Size = $extended.Size }, @{ What = 'primary'; From = $primary.Offset; Size = $primary.Size })) {
+            $to = $m.From + $shift
+            $r = Invoke-Native $engine @('move', '--disk', $number, '--from', $m.From, '--to', $to, '--journal', $journal)
+            $r.Output | Out-File (Join-Path $reportDir "extended-round-move-$($m.What -replace ' ', '-').txt") -Encoding utf8
+            if ($r.ExitCode -ne 0) { throw "moving the $($m.What) failed: $(($r.Output -split "`n" | Where-Object { $_ -notlike 'progress*' }) -join ' ')" }
+            if (-not (Get-Partition -DiskNumber $number | Where-Object { $_.Offset -eq $to -and $_.Size -eq $m.Size })) { throw "the $($m.What) is not at $to after the move" }
+        }
+        $sys = (Find-Labelled $number 'OPMSYS').Partition
+        $max = (Get-PartitionSupportedSize -DiskNumber $number -PartitionNumber $sys.PartitionNumber).SizeMax
+        if ($max -lt $sys.Size + $shift - 1MB) { throw "the first partition can only grow to $max bytes" }
+        $sys | Resize-Partition -Size $max
+        $seconds = [Math]::Round(((Get-Date) - $start).TotalSeconds, 1)
+
+        $problems = New-Object System.Collections.Generic.List[string]
+        foreach ($label in $letters.Keys) {
+            $now = [string](Find-Labelled $number $label).Partition.DriveLetter
+            if ($now -ne $letters[$label]) { $problems.Add("$label drive letter $($letters[$label]) became '$now'") }
+        }
+        foreach ($v in $volumes) {
+            $found = Find-Labelled $number $v.Label
+            if ($found.Volume.Path -ne $v.Path) { $problems.Add("$($v.Label) volume GUID changed") }
+            $bad = Test-TestData -Root $found.Volume.Path -TargetBytes $v.Bytes -Seed $v.Seed
+            if ($bad) { $problems.Add("$($v.Label): $bad file(s) differ") }
+            $scan = Repair-Volume -Path $found.Volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { $problems.Add("$($v.Label) scan: $scan") }
+        }
+        if ($problems.Count) { throw ($problems -join '; ') }
+        Add-Result $Name 'PASS' "extended partition (3 logical drives) and primary moved 256 MiB, first partition extended, in $seconds s; files identical; scans clean; volume GUIDs kept; $(if ($rdp) { 'drive letters NOT tested (Remote Desktop client running)' } else { 'drive letters kept' })"
+    }
+    catch {
+        Add-Result $Name 'FAIL' $_.Exception.Message
+    }
+    finally {
+        Remove-SelfTestDisk $vhdx
+        Remove-Item $journal -ErrorAction SilentlyContinue
+    }
+}
+
+# Raw sector write for the rollback round. Windows PowerShell's FileStream refuses device paths.
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class OpmRawDisk {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    public static void WriteSector(int disk, long offset, byte value) {
+        using (var handle = CreateFile(@"\\.\PhysicalDrive" + disk, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new IOException("open failed: " + Marshal.GetLastWin32Error());
+            using (var stream = new FileStream(handle, FileAccess.ReadWrite, 512)) {
+                var data = new byte[512];
+                for (int i = 0; i < data.Length; i++) data[i] = value;
+                stream.Seek(offset, SeekOrigin.Begin);
+                stream.Write(data, 0, data.Length);
+                stream.Flush();
+            }
+        }
+    }
+}
+'@
+
+function Get-LayoutText([int] $DiskNumber) {
+    (@(Get-Partition -DiskNumber $DiskNumber | Sort-Object Offset | ForEach-Object { "$($_.Offset)/$($_.Size)/$($_.Type)" })) -join ', '
+}
+
+function Test-RollbackRound([string] $Name) {
+    $vhdx = Join-Path $WorkDir "opm-selftest-$([guid]::NewGuid().ToString('N').Substring(0, 8)).vhdx"
+    $journal = "$vhdx.journal"
+    try {
+        $shape = New-MbrShapeDisk $vhdx
+        $number = $shape.Number
+        $rdp = [bool](Get-Process msrdc, mstsc -ErrorAction SilentlyContinue)
+        $letters = @{}
+        foreach ($label in @(if (-not $rdp) { 'OPMLOG1', 'OPMLOG3' })) {
+            $letter = Get-FreeDriveLetter
+            (Find-Labelled $number $label).Partition | Set-Partition -NewDriveLetter $letter
+            $letters[$label] = $letter
+        }
+        $before = Get-LayoutText $number
+        $extended = Get-Partition -DiskNumber $number | Where-Object Type -eq 'Extended'
+        # Far right, so source and target don't overlap (like 62 GB -> 191 GB on the real disk).
+        $to = 640MB
+        if ($to -lt $extended.Offset + $extended.Size) { throw 'test layout: target overlaps the source' }
+
+        # Kill the move once the first chunk (the last 16 MiB of the partition) is copied.
+        $log = "$journal.log"
+        $p = Start-Process -FilePath $engine -ArgumentList @('move', '--disk', $number, '--from', $extended.Offset, '--to', $to, '--journal', $journal, '--chunk', 16MB, '--delay-ms', 300, '--full-copy') -PassThru -NoNewWindow -RedirectStandardOutput $log
+        $deadline = (Get-Date).AddMinutes(5)
+        while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            if (@(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -like 'progress stage=copying*' }).Count) { break }
+            Start-Sleep -Milliseconds 50
+        }
+        if ($p.HasExited) { throw "move finished before it could be killed: $(Get-Content $log -Raw)" }
+        Stop-Process -Id $p.Id -Force
+        $p.WaitForExit()
+
+        # Damage one sector of the part already copied (unpartitioned space while the entry is out).
+        $bad = $extended.Offset + $extended.Size - 8MB
+        [OpmRawDisk]::WriteSector($number, $to + $extended.Size - 8MB, 0xEE)
+
+        $r = Invoke-Native $engine @('recover', '--disk', $number, '--journal', $journal)
+        $r.Output | Out-File (Join-Path $reportDir 'rollback-round-recover.txt') -Encoding utf8
+        if ($r.ExitCode -eq 0 -or $r.Output -notmatch 'verification failed') { throw "recovery did not catch the bad copy: $($r.Output)" }
+        if (Get-Partition -DiskNumber $number | Where-Object Type -eq 'Extended') { throw 'a copy that failed verification was put back in the table' }
+
+        $r = Invoke-Native $engine @('compare', '--disk', $number, '--journal', $journal)
+        $r.Output | Out-File (Join-Path $reportDir 'rollback-round-compare.txt') -Encoding utf8
+        $diffs = @($r.Output -split "`n" | Where-Object { $_ -like 'diff *' })
+        if ($r.ExitCode -ne 0 -or $diffs.Count -ne 1 -or $diffs[0] -notmatch "source_byte=$bad length=512 ") { throw "compare did not find exactly the damaged sector: $($r.Output)" }
+
+        $r = Invoke-Native $engine @('rollback', '--disk', $number, '--journal', $journal)
+        $r.Output | Out-File (Join-Path $reportDir 'rollback-round-rollback.txt') -Encoding utf8
+        if ($r.ExitCode -ne 0 -or $r.Output -notmatch 'result=rolled-back') { throw "rollback failed: $($r.Output)" }
+        $after = Get-LayoutText $number
+        if ($after -ne $before) { throw "layout after rollback: $after; before: $before" }
+        $r = Invoke-Native $engine @('recover', '--disk', $number, '--journal', $journal)
+        if ($r.Output -notmatch 'result=nothing-to-do') { throw "journal still unfinished after rollback: $($r.Output)" }
+
+        $problems = New-Object System.Collections.Generic.List[string]
+        foreach ($label in $letters.Keys) {
+            $now = [string](Find-Labelled $number $label).Partition.DriveLetter
+            if ($now -ne $letters[$label]) { $problems.Add("$label drive letter $($letters[$label]) became '$now'") }
+        }
+        foreach ($v in $shape.Volumes) {
+            $found = Find-Labelled $number $v.Label
+            if ($found.Volume.Path -ne $v.Path) { $problems.Add("$($v.Label) volume GUID changed") }
+            $badFiles = Test-TestData -Root $found.Volume.Path -TargetBytes $v.Bytes -Seed $v.Seed
+            if ($badFiles) { $problems.Add("$($v.Label): $badFiles file(s) differ") }
+            $scan = Repair-Volume -Path $found.Volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { $problems.Add("$($v.Label) scan: $scan") }
+        }
+        if ($problems.Count) { throw ($problems -join '; ') }
+        Add-Result $Name 'PASS' "bad copy refused, compare found the damaged sector, rollback restored the layout; files identical; scans clean; volume GUIDs kept; $(if ($rdp) { 'drive letters NOT tested (Remote Desktop client running)' } else { 'drive letters kept' })"
+    }
+    catch {
+        Add-Result $Name 'FAIL' $_.Exception.Message
+    }
+    finally {
+        Remove-SelfTestDisk $vhdx
         Remove-Item $journal, "$journal.log" -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-BusyDiskRound([string] $Name) {
+    $vhdx = Join-Path $WorkDir "opm-selftest-$([guid]::NewGuid().ToString('N').Substring(0, 8)).vhdx"
+    $journal = "$vhdx.journal"
+    try {
+        $shape = New-MbrShapeDisk $vhdx
+        $number = $shape.Number
+        $rdp = [bool](Get-Process msrdc, mstsc -ErrorAction SilentlyContinue)
+        $letters = @{}
+        foreach ($label in @(if (-not $rdp) { 'OPMLOG1', 'OPMLOG3' })) {
+            $letter = Get-FreeDriveLetter
+            (Find-Labelled $number $label).Partition | Set-Partition -NewDriveLetter $letter
+            $letters[$label] = $letter
+        }
+        $before = Get-LayoutText $number
+        $extended = Get-Partition -DiskNumber $number | Where-Object Type -eq 'Extended'
+        $to = 640MB
+        $firstLogical = Get-Partition -DiskNumber $number | Where-Object { $_.Type -ne 'Extended' -and $_.Offset -gt $extended.Offset } | Sort-Object Offset | Select-Object -First 1
+        # Windows leaves a gap between the extended partition's first sector (its boot record)
+        # and the first logical drive: 64 KiB on Server 2016, 1 MiB on newer versions.
+        $gap = $firstLogical.Offset - $extended.Offset
+        if ($gap -lt 8KB) { throw "test layout: no gap before the first logical drive ($gap bytes)" }
+        $junkAt = $extended.Offset + [long]([Math]::Floor($gap / 2 / 4KB) * 4KB)
+
+        $log = "$journal.log"
+        $p = Start-Process -FilePath $engine -ArgumentList @('move', '--disk', $number, '--from', $extended.Offset, '--to', $to, '--journal', $journal, '--chunk', 16MB, '--delay-ms', 300) -PassThru -NoNewWindow -RedirectStandardOutput $log
+        $deadline = (Get-Date).AddMinutes(5)
+        while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            if (@(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -like 'progress stage=copying*' }).Count) { break }
+            Start-Sleep -Milliseconds 50
+        }
+        if ($p.HasExited) { throw "move finished before the source could be changed: $(Get-Content $log -Raw)" }
+        # Something else writes into the source while it is being copied: halfway into the gap
+        # before the first logical drive (inside the extended partition, outside any volume, so
+        # no file is damaged). That chunk is copied last when moving right.
+        [OpmRawDisk]::WriteSector($number, $junkAt, 0xEE)
+        if (-not $p.WaitForExit(300000)) { Stop-Process -Id $p.Id -Force; throw 'move did not stop' }
+        $output = Get-Content $log -Raw
+        Copy-Item $log (Join-Path $reportDir 'busy-round-move.txt')
+        if ($p.ExitCode -eq 0) { throw "the move finished although its source changed: $output" }
+        if ($output -notmatch 'rolled_back=yes' -or $output -notmatch 'changed after it was hashed') { throw "the move did not stop and undo itself: $output" }
+        $after = Get-LayoutText $number
+        if ($after -ne $before) { throw "layout after the automatic undo: $after; before: $before" }
+
+        $problems = New-Object System.Collections.Generic.List[string]
+        foreach ($label in $letters.Keys) {
+            $now = [string](Find-Labelled $number $label).Partition.DriveLetter
+            if ($now -ne $letters[$label]) { $problems.Add("$label drive letter $($letters[$label]) became '$now'") }
+        }
+        foreach ($v in $shape.Volumes) {
+            $found = Find-Labelled $number $v.Label
+            if ($found.Volume.Path -ne $v.Path) { $problems.Add("$($v.Label) volume GUID changed") }
+            $badFiles = Test-TestData -Root $found.Volume.Path -TargetBytes $v.Bytes -Seed $v.Seed
+            if ($badFiles) { $problems.Add("$($v.Label): $badFiles file(s) differ") }
+            $scan = Repair-Volume -Path $found.Volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { $problems.Add("$($v.Label) scan: $scan") }
+        }
+        if ($problems.Count) { throw ($problems -join '; ') }
+        $copied = @($output -split "`n" | Where-Object { $_ -like 'progress stage=copying*' }).Count
+        Add-Result $Name 'PASS' "change detected after $copied chunk(s) copied, move undone automatically; files identical; scans clean; volume GUIDs kept; $(if ($rdp) { 'drive letters NOT tested (Remote Desktop client running)' } else { 'drive letters kept' })"
+    }
+    catch {
+        Add-Result $Name 'FAIL' $_.Exception.Message
+    }
+    finally {
+        Remove-SelfTestDisk $vhdx
+        Remove-Item $journal, "$journal.log", "$journal.map" -ErrorAction SilentlyContinue
     }
 }
 
@@ -290,8 +592,13 @@ if ($SkipEngineTest) {
 else {
     Write-Host "`n== Engine self-test on a throwaway VHDX in $WorkDir ==" -ForegroundColor Cyan
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-    Test-MoveRound 'Move a partition (VHDX)' $false
-    Test-MoveRound 'Kill a move and recover (VHDX)' $true
+    if (-not $RollbackOnly) {
+        Test-MoveRound 'Move a partition (VHDX)' $false
+        Test-MoveRound 'Kill a move and recover (VHDX)' $true
+        Test-ExtendedRound 'Free space after a boxed-in MBR partition (VHDX)'
+    }
+    Test-RollbackRound 'Roll back a move whose copy fails verification (VHDX)'
+    Test-BusyDiskRound 'Stop and undo a move whose source changes under it (VHDX)'
     Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
