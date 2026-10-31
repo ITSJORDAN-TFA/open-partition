@@ -22,7 +22,7 @@ mod mounted_devices;
 mod smbios;
 mod volume;
 
-pub use disk::PhysicalDisk;
+pub use disk::{BenchResult, PhysicalDisk};
 pub use error::PlatformError;
 pub use guard::{bus_type, WriteAccess, BUS_TYPE_FILE_BACKED_VIRTUAL};
 pub use journal_file::FileJournal;

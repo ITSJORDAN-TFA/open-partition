@@ -1,5 +1,6 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout as AllocLayout};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use opm_core::{
     BlockDevice, DiskIdentity, IoError, PartitionEntry, PartitionKey, PartitionTable, RangeDigest,
@@ -67,11 +68,11 @@ struct Lane {
 unsafe impl Send for Lane {}
 
 impl Lane {
-    fn open(path: &str) -> Result<Self, IoError> {
+    fn open(path: &str, access: u32) -> Result<Self, IoError> {
         Ok(Self {
             handle: Handle::open(
                 path,
-                GENERIC_READ | GENERIC_WRITE,
+                access,
                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
             )?,
             bounce: AlignedBuffer::new(PIECE),
@@ -193,7 +194,7 @@ fn overlapped_at(offset: u64) -> OVERLAPPED {
 }
 
 /// `\\.\PhysicalDriveN` opened for unbuffered, write-through I/O. Only file-backed virtual
-/// disks can be opened (see the crate docs).
+/// disks can be opened for writing (see the crate docs); any disk can be opened read-only.
 #[derive(Debug)]
 pub struct PhysicalDisk {
     number: u32,
@@ -201,7 +202,34 @@ pub struct PhysicalDisk {
     sector_size: u32,
     size: u64,
     lanes: Vec<Lane>,
+    writable: bool,
 }
+
+/// What [`PhysicalDisk::bench`] measured: `bytes` read in `elapsed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchResult {
+    pub bytes: u64,
+    pub elapsed: Duration,
+}
+
+impl BenchResult {
+    pub fn bytes_per_second(&self) -> u64 {
+        let micros = self.elapsed.as_micros().max(1);
+        u64::try_from(u128::from(self.bytes) * 1_000_000 / micros).unwrap_or(u64::MAX)
+    }
+}
+
+/// Access rights for a disk opened for writing, or for reading only.
+fn access_for(writable: bool) -> u32 {
+    if writable {
+        GENERIC_READ | GENERIC_WRITE
+    } else {
+        GENERIC_READ
+    }
+}
+
+/// What a write to a read-only disk fails with (Windows' ERROR_ACCESS_DENIED).
+const ERROR_ACCESS_DENIED: i32 = 5;
 
 impl PhysicalDisk {
     /// Open a test virtual disk.
@@ -212,10 +240,22 @@ impl PhysicalDisk {
     /// Open any disk `access` allows (see the write guard).
     pub fn open_with(number: u32, access: &WriteAccess) -> Result<Self, PlatformError> {
         require_writable(number, access)?;
+        Self::open_path(number, true)
+    }
+
+    /// Open any disk for reading only, through the same unbuffered, parallel path a move uses.
+    /// No handle has write access, so Windows itself refuses any write; the write guard isn't
+    /// needed for that and isn't consulted.
+    pub fn open_read_only(number: u32) -> Result<Self, PlatformError> {
+        Self::open_path(number, false)
+    }
+
+    fn open_path(number: u32, writable: bool) -> Result<Self, PlatformError> {
         let path = format!(r"\\.\PhysicalDrive{number}");
+        let access = access_for(writable);
         let handle = Handle::open(
             &path,
-            GENERIC_READ | GENERIC_WRITE,
+            access,
             FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
         )?;
         let geometry = handle.ioctl_vec(IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, &[], 256)?;
@@ -235,27 +275,47 @@ impl PhysicalDisk {
             sector_size,
             size,
             lanes: (0..LANES)
-                .map(|_| Lane::open(&path))
+                .map(|_| Lane::open(&path, access))
                 .collect::<Result<_, _>>()?,
+            writable,
         })
     }
 
     /// An ordinary file opened like a disk, to test the parallel I/O without a real disk.
     #[cfg(test)]
     fn open_file_for_test(path: &str, size: u64) -> Result<Self, IoError> {
+        Self::open_file_for_test_with(path, size, true)
+    }
+
+    #[cfg(test)]
+    fn open_file_for_test_with(path: &str, size: u64, writable: bool) -> Result<Self, IoError> {
+        let access = access_for(writable);
         Ok(Self {
             number: u32::MAX,
             handle: Handle::open(
                 path,
-                GENERIC_READ | GENERIC_WRITE,
+                access,
                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
             )?,
             sector_size: 4096,
             size,
             lanes: (0..LANES)
-                .map(|_| Lane::open(path))
+                .map(|_| Lane::open(path, access))
                 .collect::<Result<_, _>>()?,
+            writable,
         })
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    fn require_write_access(&self) -> Result<(), IoError> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(IoError::Os(ERROR_ACCESS_DENIED))
+        }
     }
 
     pub fn number(&self) -> u32 {
@@ -277,6 +337,7 @@ impl PhysicalDisk {
 
     /// Write a modified layout, ask Windows to re-read it, and flush.
     fn write_layout(&mut self, layout: &Layout) -> Result<(), IoError> {
+        self.require_write_access()?;
         let buffer = layout.to_set_buffer();
         self.handle
             .ioctl(IOCTL_DISK_SET_DRIVE_LAYOUT_EX, &buffer, &mut [])?;
@@ -391,6 +452,7 @@ impl BlockDevice for PhysicalDisk {
     }
 
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
+        self.require_write_access()?;
         self.check_request(offset, data.len())?;
         let pieces: Vec<(u64, &[u8])> = data
             .chunks(PIECE)
@@ -489,6 +551,31 @@ impl PhysicalDisk {
         }
         Ok(hasher.finalize().into())
     }
+
+    /// Measure read throughput: read `[offset, offset + length)` from its start, one piece per
+    /// lane at a time (the same reads a move makes), until the range is read or `budget` has
+    /// passed. Only reads; the range must be sector aligned.
+    pub fn bench(
+        &mut self,
+        offset: u64,
+        length: u64,
+        budget: Duration,
+    ) -> Result<BenchResult, IoError> {
+        let sector = u64::from(self.sector_size);
+        let length = length / sector * sector;
+        let mut buffer = vec![0u8; LANES * PIECE];
+        let started = Instant::now();
+        let mut done = 0u64;
+        while done < length && started.elapsed() < budget {
+            let n = (length - done).min(buffer.len() as u64) as usize;
+            self.read_at(offset + done, &mut buffer[..n])?;
+            done += n as u64;
+        }
+        Ok(BenchResult {
+            bytes: done,
+            elapsed: started.elapsed(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +615,49 @@ mod tests {
         assert_eq!(&file[..8192], &small[..]);
         assert!(file[3 * MIB + 4096..3 * MIB + 4096 + data.len()] == data[..]);
         assert!(file[3 * MIB + 4096 + data.len()..].iter().all(|&b| b == 0));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn bench_opens_the_disk_for_reading_only() {
+        const MIB: usize = 1 << 20;
+        let size = 80 * MIB;
+        let path = std::env::temp_dir().join(format!("opm-bench-{}.bin", std::process::id()));
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 / 4096) as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let mut disk =
+            PhysicalDisk::open_file_for_test_with(path.to_str().unwrap(), size as u64, false)
+                .unwrap();
+        assert!(!disk.is_writable());
+
+        // Reads the whole range when the budget allows, and nothing when there is no budget.
+        let all = disk
+            .bench(MIB as u64, 70 * MIB as u64, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(all.bytes, 70 * MIB as u64);
+        assert!(all.bytes_per_second() > 0);
+        let none = disk.bench(0, size as u64, Duration::ZERO).unwrap();
+        assert_eq!(none.bytes, 0);
+
+        // The disk refuses writes, and no lane's handle has write access, so Windows refuses
+        // them too, even past the disk's own check.
+        assert_eq!(
+            disk.write_at(0, &[0xAA; 4096]),
+            Err(IoError::Os(ERROR_ACCESS_DENIED))
+        );
+        for lane in &mut disk.lanes {
+            assert_eq!(
+                lane.write(0, &[0xAA; 4096]),
+                Err(IoError::Os(ERROR_ACCESS_DENIED))
+            );
+        }
+        drop(disk);
+
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "the bench changed the file"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
