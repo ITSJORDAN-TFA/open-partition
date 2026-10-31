@@ -111,8 +111,15 @@ too. Every query runs under a 1 s per-handle watchdog (a stuck worker thread is 
 Services come from `Win32_Service.ProcessId`; running dependents via `Win32_DependentService`.
 Quirks worth knowing:
 - Restart Manager alone can't answer "what uses this volume": it needs the file names first.
-- Without elevation (or for protected processes) `OpenProcess(PROCESS_DUP_HANDLE)` fails; the
-  scan reports itself partial and the message falls back to Resource Monitor / handle.exe.
+- Without elevation (or for protected processes) `OpenProcess(PROCESS_DUP_HANDLE)` fails.
+  SeDebugPrivilege is enabled for the scan only. Protected processes (csrss, lsass, Defender,
+  System, some svchost instances; checked with `GetProcessInformation(ProcessProtectionLevelInfo)`)
+  are not counted as gaps; any other process that can't be opened is named as unchecked and the
+  message points to Resource Monitor / handle.exe.
+- The watchdog is needed in practice: on the dev machine `GetFinalPathNameByHandle` blocks on
+  one disk-file handle of `RadeonSoftware.exe` (`GetFileType` returns FILE_TYPE_DISK, then the
+  name query waits on a synchronous file with I/O pending). That process is named as "some open
+  files could not be checked".
 - Process 4 (System) holds page files, SMB-shared files and driver files; it is named as
   "Windows itself" with advice instead of a stop button.
 - Shared `svchost.exe` hosts (normal on Server 2016, which predates the per-service split) get

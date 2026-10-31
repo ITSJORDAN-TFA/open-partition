@@ -23,8 +23,9 @@ public sealed record VolumeUser(int ProcessId, string ProcessName, string? AppNa
 /// <summary>Why a volume could not be locked: who uses it, as far as could be found.</summary>
 /// <param name="VolumeName">How the user knows the volume: <c>E:</c>, <c>'Apps'</c> or its GUID path.</param>
 /// <param name="SearchPath">What to search for in Resource Monitor.</param>
-/// <param name="Partial">Some processes could not be looked at, so the list may be incomplete.</param>
-public sealed record LockDiagnosis(string VolumeName, string SearchPath, IReadOnlyList<VolumeUser> Users, bool Partial)
+/// <param name="Partial">Something could not be looked at, so the list may be incomplete.</param>
+/// <param name="Unchecked">Programs (<c>name.exe (process N)</c>) with open files that could not be checked.</param>
+public sealed record LockDiagnosis(string VolumeName, string SearchPath, IReadOnlyList<VolumeUser> Users, bool Partial, IReadOnlyList<string>? Unchecked = null)
 {
     /// <summary>Services that can be stopped to free the volume (shared service hosts and Windows itself excluded).</summary>
     public IReadOnlyList<ServiceUser> StoppableServices =>
@@ -73,8 +74,8 @@ public static partial class VolumeUsers
             .FirstOrDefault(v => v is not null && string.Equals(v.Path, path, StringComparison.OrdinalIgnoreCase));
         var name = volume?.DriveLetter is { } letter ? $"{letter}:" : volume?.Label is { Length: > 0 } label ? $"'{label}'" : path;
         var root = volume?.DriveLetter is { } l ? $"{l}:\\" : path;
-        var (users, partial) = Find(path, root);
-        return new LockDiagnosis(name, root, users, partial);
+        var (users, partial, notChecked) = Find(path, root);
+        return new LockDiagnosis(name, root, users, partial, notChecked);
     }
 
     /// <summary>The message for a lock failure. Pure: no system calls.</summary>
@@ -84,7 +85,7 @@ public static partial class VolumeUsers
         if (d.Users.Count == 0)
         {
             text.Append(d.Partial
-                ? $" No program could be found using it, but not every program could be checked{(Environment.IsPrivilegedProcess ? "" : " (run as Administrator to check them all)")}."
+                ? $" No program could be found using it, but {Gaps(d)}."
                 : " No program was found with files open on it; it may have been a short-lived use (antivirus, the indexer, an Explorer window). Try again.");
         }
         else
@@ -101,7 +102,7 @@ public static partial class VolumeUsers
             text.Append('\n').Append(NextSteps(d, hint));
             if (d.Partial)
             {
-                text.Append(" Some programs could not be checked, so this list may be incomplete.");
+                text.Append(CultureInfo.InvariantCulture, $" This list may be incomplete: {Gaps(d)}.");
             }
         }
         if (d.Users.Count == 0 || d.Partial)
@@ -109,6 +110,17 @@ public static partial class VolumeUsers
             text.Append(CultureInfo.InvariantCulture, $" To see every program with files open on it, use Resource Monitor (CPU tab, Associated Handles, search \"{d.SearchPath}\") or Sysinternals handle.exe.");
         }
         return text.ToString();
+    }
+
+    private static string Gaps(LockDiagnosis d)
+    {
+        var admin = Environment.IsPrivilegedProcess ? "" : " (run as Administrator to check them all)";
+        if (d.Unchecked is not { Count: > 0 } names)
+        {
+            return $"not every program could be checked{admin}";
+        }
+        var listed = string.Join(", ", names.Take(4)) + (names.Count > 4 ? $" and {names.Count - 4} more" : "");
+        return $"some open files of {listed} could not be checked{admin}";
     }
 
     /// <summary>Label of the GUI button that stops <paramref name="services"/> and retries.</summary>
@@ -183,7 +195,7 @@ public static partial class VolumeUsers
         return $"{char.ToUpperInvariant(sentence[0])}{sentence[1..]}, then try again.";
     }
 
-    private static (List<VolumeUser> Users, bool Partial) Find(string volumePath, string root)
+    private static (List<VolumeUser> Users, bool Partial, List<string> Unchecked) Find(string volumePath, string root)
     {
         var partial = false;
         OpenFileScan scan;
@@ -261,7 +273,8 @@ public static partial class VolumeUsers
             services.GetValueOrDefault(pid) ?? [],
             files.GetValueOrDefault(pid) ?? [],
             fromVolume.Contains(pid))).ToList();
-        return (users, partial);
+        var notChecked = (scan.Unchecked ?? []).Select(pid => $"{ProcessName(pid)} (process {pid})").ToList();
+        return (users, partial, notChecked);
     }
 
     private static string ProcessName(int pid)

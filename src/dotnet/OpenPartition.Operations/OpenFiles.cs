@@ -7,8 +7,12 @@ namespace OpenPartition.Operations;
 /// <summary>Files one process has open on the volume.</summary>
 internal sealed record OpenFileHolder(int ProcessId, IReadOnlyList<string> Files);
 
-/// <summary>What the handle scan found, and whether it could look everywhere.</summary>
-internal sealed record OpenFileScan(IReadOnlyList<OpenFileHolder> Holders, bool Partial);
+/// <summary>
+/// What the handle scan found. <paramref name="Unchecked"/> are processes with handles that
+/// could not be looked at (access refused, or a query that never returned); protected system
+/// processes are left out. <paramref name="Partial"/> is set when anything was missed.
+/// </summary>
+internal sealed record OpenFileScan(IReadOnlyList<OpenFileHolder> Holders, bool Partial, IReadOnlyList<int>? Unchecked = null);
 
 /// <summary>A process Restart Manager says is using the files.</summary>
 internal sealed record RestartManagerEntry(int ProcessId, string AppName, string ServiceName);
@@ -28,6 +32,9 @@ internal static partial class OpenFiles
     private const uint DuplicateSameAccess = 0x2;
     private const uint FileTypeDisk = 1;
     private const uint VolumeNameNt = 0x2;
+    private const uint ProcessQueryLimitedInformation = 0x1000;
+    private const int ProcessProtectionLevelInfo = 7;
+    private const uint ProtectionLevelNone = 0xFFFF_FFFE;
     private static readonly TimeSpan QueryTimeout = TimeSpan.FromSeconds(1);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -74,7 +81,87 @@ internal static partial class OpenFiles
             .Where(e => onlyProcess is null || (int)e.UniqueProcessId == onlyProcess)
             .Select(e => ((int)e.UniqueProcessId, checked((IntPtr)(long)e.HandleValue)))
             .ToList();
+        // Administrators need the debug privilege to look inside services running as SYSTEM.
+        // It is enabled for the scan only, then put back as it was.
+        using var debug = DebugPrivilege.Enable();
         return new Scan(device.TrimEnd('\\') + "\\", displayRoot, candidates, budget, maxFilesPerProcess).Run();
+    }
+
+    /// <summary>
+    /// Protected processes (antivirus, csrss, lsass…) can't be looked inside even by an
+    /// administrator. They are not counted as gaps in the scan.
+    /// </summary>
+    private static unsafe bool IsProtected(int pid)
+    {
+        using var process = OpenProcess(ProcessQueryLimitedInformation, false, (uint)pid);
+        if (process.IsInvalid)
+        {
+            // Not even basic information: a minimal system process (Registry, Secure System).
+            return true;
+        }
+        var level = ProtectionLevelNone;
+        return GetProcessInformation(process, ProcessProtectionLevelInfo, &level, sizeof(uint)) && level != ProtectionLevelNone;
+    }
+
+    /// <summary>SeDebugPrivilege, enabled while this is alive (if the user holds it at all).</summary>
+    private sealed unsafe class DebugPrivilege : IDisposable
+    {
+        private const uint TokenAdjustPrivileges = 0x20;
+        private const uint TokenQuery = 0x8;
+        private const uint SePrivilegeEnabled = 0x2;
+
+        private readonly SafeAccessTokenHandle token;
+        private TokenPrivileges previous;
+
+        // TOKEN_PRIVILEGES with one LUID_AND_ATTRIBUTES; a LUID is two 4-byte halves (no padding).
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenPrivileges
+        {
+            public uint Count;
+            public Luid Luid;
+            public uint Attributes;
+        }
+
+        private DebugPrivilege(SafeAccessTokenHandle token, TokenPrivileges previous)
+        {
+            this.token = token;
+            this.previous = previous;
+        }
+
+        public static DebugPrivilege? Enable()
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), TokenAdjustPrivileges | TokenQuery, out var token))
+            {
+                token.Dispose();
+                return null;
+            }
+            var wanted = new TokenPrivileges { Count = 1, Attributes = SePrivilegeEnabled };
+            if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out wanted.Luid))
+            {
+                token.Dispose();
+                return null;
+            }
+            var previous = default(TokenPrivileges);
+            if (!AdjustTokenPrivileges(token, false, &wanted, (uint)sizeof(TokenPrivileges), &previous, out _))
+            {
+                token.Dispose();
+                return null;
+            }
+            return new DebugPrivilege(token, previous);
+        }
+
+        public void Dispose()
+        {
+            // An empty previous state (Count 0) means it was already enabled: nothing to undo.
+            if (previous.Count > 0)
+            {
+                fixed (TokenPrivileges* p = &previous)
+                {
+                    _ = AdjustTokenPrivileges(token, false, p, 0, null, out _);
+                }
+            }
+            token.Dispose();
+        }
     }
 
     /// <summary>The volume GUID path (<c>\\?\Volume{…}\</c>) of a mount point such as <c>C:\</c>, or null.</summary>
@@ -150,6 +237,8 @@ internal static partial class OpenFiles
         private readonly Dictionary<int, SafeProcessHandle?> processes = [];
         private int next;
         private int generation;
+        private readonly HashSet<int> unopened = [];
+        private readonly HashSet<int> stuck = [];
         private bool partial;
 
         public OpenFileScan Run()
@@ -174,7 +263,7 @@ internal static partial class OpenFiles
                     using var done = new ManualResetEventSlim();
                     new Thread(() => Work(mine, done)) { IsBackground = true, Name = "Volume user scan" }.Start();
                     var since = DateTime.UtcNow;
-                    var stuck = false;
+                    var giveUp = false;
                     while (!done.Wait(TimeSpan.FromMilliseconds(100)))
                     {
                         int now;
@@ -189,20 +278,28 @@ internal static partial class OpenFiles
                         }
                         if (DateTime.UtcNow >= deadline || DateTime.UtcNow - since > QueryTimeout)
                         {
-                            stuck = true;
+                            giveUp = true;
                             break;
                         }
                     }
-                    if (!stuck)
+                    if (!giveUp)
                     {
                         break;
                     }
                     lock (gate)
                     {
-                        // Leave that worker behind and skip the handle it is stuck on.
+                        // Leave that worker behind and skip the handle it is stuck on (a file
+                        // with I/O pending on it). Out of time: the rest goes unchecked.
                         generation++;
+                        if (DateTime.UtcNow >= deadline)
+                        {
+                            partial = true;
+                        }
+                        else if (next < candidates.Count)
+                        {
+                            stuck.Add(candidates[next].Pid);
+                        }
                         next++;
-                        partial = true;
                     }
                     if (++abandoned >= 3 || DateTime.UtcNow >= deadline)
                     {
@@ -212,9 +309,12 @@ internal static partial class OpenFiles
                 lock (gate)
                 {
                     generation++;
+                    unopened.RemoveWhere(IsProtected);
+                    unopened.UnionWith(stuck);
                     return new OpenFileScan(
                         found.OrderBy(f => f.Key).Select(f => new OpenFileHolder(f.Key, f.Value.Order(StringComparer.OrdinalIgnoreCase).ToList())).ToList(),
-                        partial);
+                        partial || unopened.Count > 0,
+                        unopened.Order().ToList());
                 }
             }
             finally
@@ -250,7 +350,10 @@ internal static partial class OpenFiles
                         {
                             process = Open(candidate.Pid);
                             processes[candidate.Pid] = process;
-                            partial |= process is null;
+                            if (process is null)
+                            {
+                                unopened.Add(candidate.Pid);
+                            }
                         }
                         if (process is null || (found.TryGetValue(candidate.Pid, out var already) && already.Count >= maxFilesPerProcess))
                         {
@@ -413,6 +516,13 @@ internal static partial class OpenFiles
         }
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid
+    {
+        public uint Low;
+        public int High;
+    }
+
     // ---- Imports. Nothing here opens anything for writing. ----
 
     [LibraryImport("ntdll.dll")]
@@ -430,6 +540,22 @@ internal static partial class OpenFiles
 
     [LibraryImport("kernel32.dll")]
     private static partial IntPtr GetCurrentProcess();
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static unsafe partial bool GetProcessInformation(SafeProcessHandle process, int infoClass, void* info, uint size);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool OpenProcessToken(IntPtr process, uint access, out SafeAccessTokenHandle token);
+
+    [LibraryImport("advapi32.dll", EntryPoint = "LookupPrivilegeValueW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool LookupPrivilegeValue(string? system, string name, out Luid luid);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static unsafe partial bool AdjustTokenPrivileges(SafeAccessTokenHandle token, [MarshalAs(UnmanagedType.Bool)] bool disableAll, void* newState, uint length, void* previousState, out uint returnLength);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
