@@ -331,3 +331,17 @@ Shipped since the "Operations in the GUI and CLI" section above:
   - Drag-to-place Move/Extend dialogs with exact MiB fields and a whole-disk strip.
 - **Releases:** CI publishes `openpartition-<version>-win-x64.zip` to GitHub Releases (tags
   `v*`), and a rolling `preview` pre-release from `main`.
+
+### Issue #9 continuation safety review (2026-11-01)
+
+Recovered the prior implementation and uncommitted formatting documentation into
+`feat/volume-users-restart-manager-sol`, preserving the original worktree. Formatting now
+receives elevation state in the diagnosis and does no system calls. Native handle-list
+bounds are checked before reading entries. Timed-out queries always mark detection partial;
+at most three scan workers can remain stuck across repeated diagnoses. Native path queries
+cannot be safely cancelled, so a stuck worker can retain its duplicated handle until exit.
+Service retry refuses newly discovered dependents outside the confirmed list, rather than
+silently expanding consent. Failure text acknowledges services already stopped before a failure.
+The VHDX holder test now exits cooperatively, without terminating a host process.
+Full host integration includes process termination for crash tests; it is not run when host
+process termination is prohibited. Run that suite in a disposable VM instead.

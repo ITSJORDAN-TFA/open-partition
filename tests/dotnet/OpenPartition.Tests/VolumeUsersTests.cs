@@ -14,6 +14,14 @@ public class VolumeUsersTests
     private static LockDiagnosis Diagnosis(bool partial = false, params VolumeUser[] users) => new("E:", @"E:\", users, partial);
 
     [Fact]
+    public void ChangedDependentsRequireNewConsent()
+    {
+        ServiceControl.EnsureConsentedDependents(Sql, ["sqlserveragent"]);
+        ServiceControl.EnsureConsentedDependents(Sql, []);
+        Assert.Throws<OperationFailedException>(() => ServiceControl.EnsureConsentedDependents(Sql, ["NewService"]));
+    }
+
+    [Fact]
     public void NamesAProgramWithAFileOpen()
     {
         var message = VolumeUsers.Format(Diagnosis(false, new VolumeUser(4321, "notepad.exe", "Notepad", [], [@"E:\notes.txt"])), StopHint.Command);

@@ -25,7 +25,7 @@ public sealed record VolumeUser(int ProcessId, string ProcessName, string? AppNa
 /// <param name="SearchPath">What to search for in Resource Monitor.</param>
 /// <param name="Partial">Something could not be looked at, so the list may be incomplete.</param>
 /// <param name="Unchecked">Programs (<c>name.exe (process N)</c>) with open files that could not be checked.</param>
-public sealed record LockDiagnosis(string VolumeName, string SearchPath, IReadOnlyList<VolumeUser> Users, bool Partial, IReadOnlyList<string>? Unchecked = null)
+public sealed record LockDiagnosis(string VolumeName, string SearchPath, IReadOnlyList<VolumeUser> Users, bool Partial, IReadOnlyList<string>? Unchecked = null, bool IsElevated = false)
 {
     /// <summary>Services that can be stopped to free the volume (shared service hosts and Windows itself excluded).</summary>
     public IReadOnlyList<ServiceUser> StoppableServices =>
@@ -75,7 +75,7 @@ public static partial class VolumeUsers
         var name = volume?.DriveLetter is { } letter ? $"{letter}:" : volume?.Label is { Length: > 0 } label ? $"'{label}'" : path;
         var root = volume?.DriveLetter is { } l ? $"{l}:\\" : path;
         var (users, partial, notChecked) = Find(path, root);
-        return new LockDiagnosis(name, root, users, partial, notChecked);
+        return new LockDiagnosis(name, root, users, partial, notChecked, Environment.IsPrivilegedProcess);
     }
 
     /// <summary>The message for a lock failure. Pure: no system calls.</summary>
@@ -114,7 +114,7 @@ public static partial class VolumeUsers
 
     private static string Gaps(LockDiagnosis d)
     {
-        var admin = Environment.IsPrivilegedProcess ? "" : " (run as Administrator to check them all)";
+        var admin = d.IsElevated ? "" : " (run as Administrator to check them all)";
         if (d.Unchecked is not { Count: > 0 } names)
         {
             return $"not every program could be checked{admin}";

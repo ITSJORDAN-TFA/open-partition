@@ -587,13 +587,14 @@ function Test-LockFailureNamesTheProgramHoldingAFile {
     $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
     $path = Join-Path $env:OPM_HARNESS_OUT "lock-$layout-$id.vhdx"
     $holder = $null
+    $stopFile = Join-Path $env:OPM_HARNESS_OUT "holder-stop-$id"
     try {
         $null = New-TestDisk -Layout $layout -Path $path -Seed 19
         $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
         $before = Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label 'DATA1'
         $file = Join-Path $before.Volume.Path 'held-open.txt'
 
-        $script = "`$f = [IO.File]::Open('$file', 'OpenOrCreate', 'ReadWrite', 'None'); Start-Sleep -Seconds 300"
+        $script = "`$f = [IO.File]::Open('$file', 'OpenOrCreate', 'ReadWrite', 'None'); try { while (-not [IO.File]::Exists('$stopFile')) { Start-Sleep -Milliseconds 100 } } finally { `$f.Dispose() }"
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
         $holder = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -PassThru -WindowStyle Hidden
         $deadline = (Get-Date).AddSeconds(30)
@@ -616,7 +617,11 @@ function Test-LockFailureNamesTheProgramHoldingAFile {
         if ($after.Offset -ne $before.Partition.Offset) { throw 'The partition moved although the move was refused.' }
     }
     finally {
-        if ($holder -and -not $holder.HasExited) { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+        if ($holder -and -not $holder.HasExited) {
+            [IO.File]::WriteAllText($stopFile, 'stop')
+            if (-not $holder.WaitForExit(30000)) { throw 'The cooperative file holder did not exit; its test VHDX is left mounted for inspection.' }
+        }
+        Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
         Dismount-VHD -Path $path -ErrorAction SilentlyContinue
         Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
     }

@@ -35,6 +35,7 @@ internal static partial class OpenFiles
     private const uint ProcessQueryLimitedInformation = 0x1000;
     private const int ProcessProtectionLevelInfo = 7;
     private const uint ProtectionLevelNone = 0xFFFF_FFFE;
+    private static readonly SemaphoreSlim ScanWorkers = new(3, 3);
     private static readonly TimeSpan QueryTimeout = TimeSpan.FromSeconds(1);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -217,6 +218,10 @@ internal static partial class OpenFiles
                 }
                 // SYSTEM_HANDLE_INFORMATION_EX: count, reserved, then the entries.
                 var count = (long)*(UIntPtr*)buffer;
+                if (count < 0 || count > (size - 2 * IntPtr.Size) / sizeof(HandleEntry))
+                {
+                    throw new Win32Exception("The system handle list has an invalid length.");
+                }
                 return new ReadOnlySpan<HandleEntry>((byte*)buffer + (2 * IntPtr.Size), checked((int)count)).ToArray();
             }
             finally
@@ -260,6 +265,13 @@ internal static partial class OpenFiles
                     {
                         break;
                     }
+                    // Stuck kernel calls cannot be cancelled safely. Bound their total across
+                    // repeated diagnoses, rather than leaking three threads on every retry.
+                    if (!ScanWorkers.Wait(0))
+                    {
+                        partial = true;
+                        break;
+                    }
                     using var done = new ManualResetEventSlim();
                     new Thread(() => Work(mine, done)) { IsBackground = true, Name = "Volume user scan" }.Start();
                     var since = DateTime.UtcNow;
@@ -291,6 +303,7 @@ internal static partial class OpenFiles
                         // Leave that worker behind and skip the handle it is stuck on (a file
                         // with I/O pending on it). Out of time: the rest goes unchecked.
                         generation++;
+                        partial = true;
                         if (DateTime.UtcNow >= deadline)
                         {
                             partial = true;
@@ -386,6 +399,7 @@ internal static partial class OpenFiles
             }
             finally
             {
+                ScanWorkers.Release();
                 // The coordinator may have given up on this worker and disposed the event.
                 try
                 {

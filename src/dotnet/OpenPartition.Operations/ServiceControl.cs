@@ -39,13 +39,23 @@ public static class ServiceControl
             scope.Connect();
             foreach (var service in services)
             {
-                foreach (var dependent in RunningDependents(scope, service.Name))
+                var dependents = RunningDependents(scope, service.Name);
+                EnsureConsentedDependents(service, dependents);
+                foreach (var dependent in dependents)
                 {
                     Stop(scope, dependent, progress, cancellationToken);
                 }
                 Stop(scope, service.Name, progress, cancellationToken);
             }
         }, cancellationToken);
+
+    internal static void EnsureConsentedDependents(ServiceUser service, IReadOnlyList<string> current)
+    {
+        if (current.Any(name => !service.RunningDependents.Contains(name, StringComparer.OrdinalIgnoreCase)))
+        {
+            throw new OperationFailedException($"The dependent services for {service.Name} changed. Retry detection and review the service list before stopping services. Some previously approved services may already have stopped.");
+        }
+    }
 
     private static List<string> DirectDependents(ManagementScope scope, string service)
     {
@@ -78,7 +88,7 @@ public static class ServiceControl
         // 5: "can't accept control" also covers a service that is already stopping.
         if (code is not (0 or 5))
         {
-            throw new OperationFailedException($"Windows would not stop service {name} ({Reason(code)}). Nothing else was changed. Stop it from Services (services.msc), then try again.");
+            throw new OperationFailedException($"Windows would not stop service {name} ({Reason(code)}). Some previously approved services may already have stopped; no disk operation was retried. Stop it from Services (services.msc), then try again.");
         }
         var deadline = DateTime.UtcNow + StopTimeout;
         while (true)
@@ -91,7 +101,7 @@ public static class ServiceControl
             }
             if (DateTime.UtcNow > deadline)
             {
-                throw new OperationFailedException($"Service {name} did not stop within {StopTimeout.TotalSeconds:0} seconds (it is '{State(service)}'). Nothing else was changed. Check it in Services (services.msc), then try again.");
+                throw new OperationFailedException($"Service {name} did not stop within {StopTimeout.TotalSeconds:0} seconds (it is '{State(service)}'). Some previously approved services may already have stopped; no disk operation was retried. Check it in Services (services.msc), then try again.");
             }
             Thread.Sleep(500);
         }
