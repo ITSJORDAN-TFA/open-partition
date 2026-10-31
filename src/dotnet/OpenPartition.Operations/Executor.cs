@@ -2,8 +2,11 @@ using OpenPartition.Model;
 
 namespace OpenPartition.Operations;
 
-/// <summary>Where a queue run stopped, for the caller to report.</summary>
-public sealed record RunResult(int Completed, int Total, PlannedStep? FailedStep, string? Error, bool Stopped = false)
+/// <summary>
+/// Where a queue run stopped, for the caller to report. <paramref name="Lock"/> says who held a
+/// volume open when that is why the step failed.
+/// </summary>
+public sealed record RunResult(int Completed, int Total, PlannedStep? FailedStep, string? Error, bool Stopped = false, LockDiagnosis? Lock = null)
 {
     public bool Succeeded => FailedStep is null && !Stopped;
 }
@@ -60,7 +63,9 @@ public static class Executor
             }
             catch (Exception e) when (e is OperationFailedException or System.Management.ManagementException or IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
             {
-                return new RunResult(i, steps.Count, step, VolumeUsers.Explain(e.Message, snapshot));
+                var message = e.Message;
+                var users = await Task.Run(() => VolumeUsers.Diagnose(message, snapshot), CancellationToken.None).ConfigureAwait(false);
+                return new RunResult(i, steps.Count, step, users is null ? message : VolumeUsers.Format(users, StopHint.Command), Lock: users);
             }
         }
         return new RunResult(steps.Count, steps.Count, null, null);

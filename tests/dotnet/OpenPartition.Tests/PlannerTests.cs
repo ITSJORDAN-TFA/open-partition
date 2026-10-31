@@ -178,7 +178,12 @@ public class PlannerTests
         var unlettered = disk with { Partitions = disk.Partitions.Select(p => p == e ? p with { Volume = p.Volume! with { DriveLetter = null, Label = "Apps" } } : p).ToList() };
         var snapshot = new SystemSnapshot { CollectedAt = DateTimeOffset.UnixEpoch, MachineName = "t", OsVersion = "10", IsElevated = true, Disks = [unlettered] };
         var error = $"refused: could not lock {e.Volume!.Path}: files on it are open. Close the programs";
-        var explained = VolumeUsers.Explain(error, snapshot);
+        Assert.Equal(e.Volume!.Path, VolumeUsers.LockedVolume(error));
+        Assert.Null(VolumeUsers.LockedVolume("disk I/O failed"));
+        // Diagnose scans this machine; only its naming of the volume is checked here.
+        var diagnosis = VolumeUsers.Diagnose(error, snapshot)!;
+        Assert.Equal("'Apps'", diagnosis.VolumeName);
+        var explained = VolumeUsers.Format(diagnosis with { Users = [], Partial = false }, StopHint.Command);
         Assert.StartsWith("'Apps' is in use", explained, StringComparison.Ordinal);
         Assert.Contains("Nothing was changed", explained, StringComparison.Ordinal);
         Assert.Equal("disk I/O failed", VolumeUsers.Explain("disk I/O failed", snapshot));
