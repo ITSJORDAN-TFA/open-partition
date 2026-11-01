@@ -85,6 +85,10 @@ public sealed record PartitionInfo
     public bool IsActive { get; init; }
     /// <summary>MBR logical partition inside an extended partition.</summary>
     public bool IsLogical { get; init; }
+    /// <summary>For a logical drive: where its EBR (the table describing it) sits. The first
+    /// logical drive's EBR is at the start of the extended partition; the others move with
+    /// their drive.</summary>
+    public long? EbrOffset { get; init; }
     /// <summary>Holds the running Windows installation.</summary>
     public bool IsBoot { get; init; }
     /// <summary>Holds the boot manager (EFI System partition or active MBR partition).</summary>

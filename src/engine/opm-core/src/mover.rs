@@ -54,8 +54,15 @@ pub trait PartitionTable {
         start: u64,
     ) -> Result<(), IoError>;
 
-    /// Whether no partition in the table overlaps `[start, start + length)`.
-    fn range_is_free(&mut self, start: u64, length: u64) -> Result<bool, IoError>;
+    /// Whether no partition in the table overlaps `[start, start + length)`, as a place for
+    /// `partition`. A partition that contains it (the extended partition around a logical
+    /// drive) doesn't count; whatever else is inside that one does.
+    fn range_is_free(
+        &mut self,
+        partition: PartitionKey,
+        start: u64,
+        length: u64,
+    ) -> Result<bool, IoError>;
 }
 
 /// A strong digest (SHA-256 on Windows) of data the mover has read. Kept out of the core so it
@@ -485,7 +492,7 @@ where
     match disk.partition_start(record.partition)? {
         Some(start) if start == record.source_offset => {}
         None => {
-            if !disk.range_is_free(record.source_offset, record.length)? {
+            if !disk.range_is_free(record.partition, record.source_offset, record.length)? {
                 return Err(MoveError::RangeInUse {
                     offset: record.source_offset,
                 });
@@ -534,7 +541,7 @@ fn expect_start<D: PartitionTable>(
 /// While the entry is out of the table, no other partition may claim the source or target.
 fn expect_free<D: PartitionTable>(disk: &mut D, record: &MoveRecord) -> Result<(), MoveError> {
     for offset in [record.source_offset, record.target_offset] {
-        if !disk.range_is_free(offset, record.length)? {
+        if !disk.range_is_free(record.partition, offset, record.length)? {
             return Err(MoveError::RangeInUse { offset });
         }
     }

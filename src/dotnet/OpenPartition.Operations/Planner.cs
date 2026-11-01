@@ -71,7 +71,12 @@ public static class Planner
     /// <summary>Where <paramref name="p"/> can start: anywhere in the free space around it.</summary>
     public static MoveRange? Range(DiskInfo disk, PartitionInfo p)
     {
-        var (gapStart, gapEnd) = Gap(disk, p);
+        var gap = p.IsLogical ? LogicalMoveGap(disk, p) : Gap(disk, p);
+        if (gap is not { } found)
+        {
+            return null;
+        }
+        var (gapStart, gapEnd) = found;
         var min = AlignUp(gapStart);
         var max = AlignDown(gapEnd - p.Size);
         if (min > max || (min == max && min == p.Offset))
@@ -159,7 +164,7 @@ public static class Planner
                     return rest;
                 }
                 var before = rest.Where(s => s.DiskNumber == original.Number).Aggregate(original, Apply);
-                var partition = before.Partitions.FirstOrDefault(p => p.Offset == last.From && !p.IsLogical);
+                var partition = At(before, last.From);
                 if (partition is not null)
                 {
                     try
@@ -206,13 +211,27 @@ public static class Planner
     };
 
     private static PartitionInfo Find(DiskInfo disk, long offset) =>
-        disk.Partitions.FirstOrDefault(p => p.Offset == offset && !p.IsLogical)
+        At(disk, offset)
         ?? throw new PlanException($"No partition starts at byte {offset} on disk {disk.Number}.");
+
+    /// <summary>The partition starting at <paramref name="offset"/>: a primary or extended one, else a logical drive.</summary>
+    private static PartitionInfo? At(DiskInfo disk, long offset) =>
+        disk.Partitions.FirstOrDefault(p => p.Offset == offset && !p.IsLogical)
+        ?? disk.Partitions.FirstOrDefault(p => p.Offset == offset && p.IsLogical);
 
     private static IEnumerable<PartitionInfo> Shift(DiskInfo disk, PartitionInfo moving, long delta)
     {
         var group = MovingWith(disk, moving).ToHashSet();
-        return disk.Partitions.Select(p => group.Contains(p) ? p with { Offset = p.Offset + delta } : p);
+        // A logical drive's EBR moves with it, apart from the first one's, at the container
+        // start, which only moves with the whole extended partition.
+        var firstEbr = ContainerOf(disk, moving)?.Offset;
+        return disk.Partitions.Select(p => group.Contains(p)
+            ? p with
+            {
+                Offset = p.Offset + delta,
+                EbrOffset = p.EbrOffset is { } ebr && ebr != firstEbr ? ebr + delta : p.EbrOffset,
+            }
+            : p);
     }
 
     private static VolumeInfo? Grow(VolumeInfo? volume, long delta) => volume switch
@@ -248,6 +267,31 @@ public static class Planner
             end = p.End;
         }
         return (start, end);
+    }
+
+    /// <summary>
+    /// Where a logical drive's data may lie when it moves: inside its extended partition, after
+    /// the drive before it and before the next drive's EBR. Its own EBR moves with it and keeps
+    /// its distance in front of the data, except the first drive's, which stays at the start of
+    /// the extended partition. <c>null</c> when the chain isn't known well enough.
+    /// </summary>
+    private static (long Start, long End)? LogicalMoveGap(DiskInfo disk, PartitionInfo p)
+    {
+        if (ContainerOf(disk, p) is not { } container || p.EbrOffset is not { } ebr || ebr >= p.Offset || ebr < container.Offset)
+        {
+            return null;
+        }
+        var sector = disk.LogicalSectorSize;
+        var others = disk.Partitions.Where(o => o != p && o.IsLogical && o.Size > 0).ToList();
+        if (others.Any(o => o.EbrOffset is null))
+        {
+            return null;
+        }
+        // The first drive's EBR is the one at the container start; nothing may go over it.
+        var lead = ebr == container.Offset ? 0 : p.Offset - ebr;
+        var floor = others.Where(o => o.End <= p.Offset).Select(o => o.End).Append(container.Offset + sector).Max();
+        var end = others.Where(o => o.Offset >= p.End).Select(o => o.EbrOffset!.Value).Append(container.End).Min();
+        return (floor + lead, end);
     }
 
     private static long AlignUp(long v) => (v + Alignment - 1) / Alignment * Alignment;

@@ -100,8 +100,8 @@ public static class Classifier
         }
         if (p.IsLogical)
         {
-            issues.Add(new("partition.logical", IssueSeverity.Blocker,
-                "Logical drive inside an MBR extended partition. It can't be moved on its own; move the extended partition that holds it. It can be extended into free space inside the extended partition.", OperationKind.Move));
+            issues.Add(new("partition.logical", IssueSeverity.Info,
+                "Logical drive inside an MBR extended partition. It can move within the free space around it inside the extended partition, and be extended into free space inside it. To take it further, move the extended partition that holds it."));
         }
         if (p.IsSystem && p.Role != PartitionRole.EfiSystem)
         {

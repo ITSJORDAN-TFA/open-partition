@@ -91,6 +91,7 @@ name = "opm-platform-sim"
 version = "0.1.0"
 dependencies = [
  "opm-core",
+ "opm-platform-win32",
  "sha2",
 ]
 

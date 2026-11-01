@@ -98,6 +98,41 @@ SYS by moving the extended partition and PRIM, extend SYS), including an engine 
 resume`; the GUI driven by UI Automation through the same flow
 (`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
+### Moving one logical drive inside its extended partition (#14, journal format 5)
+
+A logical drive can now move on its own, inside the free space between its neighbours (to close
+a gap), instead of only with the whole container. How Windows models the chain matters here:
+`DRIVE_LAYOUT_INFORMATION_EX` lists one group of four entries per EBR. Group 1 is the EBR at
+the container start; each later EBR sits where the previous group's link entry (type 0x05)
+starts. Logical starts are absolute in the layout; on disk they are relative to their own EBR,
+links relative to the container start.
+
+- **Key.** `MBRL` + source and target start (in 512-byte units), so the mover finds the
+  logical at either place. `Layout::find` matches a logical entry starting at either.
+- **Detach** takes out only that logical. The first logical's slot in the EBR at the container
+  start is emptied in place (that EBR has to stay); a later one is unlinked: the previous
+  group's link takes over its outgoing link and its group leaves the array. One EBR sector
+  changes either way, so a torn table write can't break the chain.
+- **Attach** puts it back at the target. A later logical's EBR moves with it, keeping its
+  distance from the data (Windows puts it 1 MiB before), and the group goes back after the
+  group with the nearest earlier EBR. **The new EBR sector is pre-written and flushed before
+  the table write**, so whichever sectors of Windows' rewrite land before a crash, every link
+  points at a valid EBR. Without that, a link written before its EBR would point at stale data
+  and Windows would drop every logical drive after it from the table.
+- **Snapshot**: the logical's raw entry plus the incoming link entry (the container entry for
+  the first logical), which gives the old EBR position. Tag `W32LOGI1`.
+- **Core**: `PartitionTable::range_is_free` now gets the partition key, so a logical's own
+  container doesn't count as occupying its range, while other logicals, their EBRs (link
+  entries) and the EBR at the container start still do.
+- `FORMAT_VERSION` 5: the record layout is unchanged, but an older engine must not resume a
+  logical-drive move. Version 4 journals still load.
+- MountedDevices remap covers just the moved logical; its neighbours keep their starts.
+- Crash campaign: `opm-platform-sim/tests/logical_campaign.rs` keeps the table in real MBR/EBR
+  sectors and rewrites them the way Windows does (every table sector, one flush at the end),
+  so power cuts land between EBR writes; first, middle and last logical, left and right.
+- Not yet verified on VHDX here (needs elevation and Hyper-V): whether partmgr keeps the
+  neighbouring logical volumes online across the chain rewrite.
+
 ---
 
 ## 1. Decisions to make now

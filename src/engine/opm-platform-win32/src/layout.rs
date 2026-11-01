@@ -2,21 +2,49 @@
 //!
 //! The raw buffer from `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` is kept and edited byte by byte, so
 //! every field this code doesn't understand is written back exactly as Windows gave it.
+//!
+//! **MBR logical drives.** Windows lists one group of four entries per partition table: group
+//! 0 is the MBR, group 1 the EBR at the start of the extended partition, and each later EBR
+//! sits where the previous group's link entry (an extended type) starts. A logical drive's
+//! start is absolute in the layout; on disk it is relative to its own EBR, and a link's start
+//! is relative to the extended partition.
 
-use opm_core::{IoError, PartitionEntry, PartitionKey, ENTRY_SIZE};
+use opm_core::{BlockDevice, IoError, PartitionEntry, PartitionKey, ENTRY_SIZE};
 
 const HEADER: usize = 48;
 const ENTRY: usize = 144;
 
+// Fields of PARTITION_INFORMATION_EX.
+const START: usize = 8;
+const LENGTH: usize = 16;
+const NUMBER: usize = 24;
+const MBR_TYPE: usize = 32;
+const MBR_BOOT: usize = 33;
+const MBR_RECOGNIZED: usize = 34;
+const MBR_HIDDEN: usize = 36;
+
 const MBR_KEY_PREFIX: &[u8; 8] = b"MBR-SLOT";
+/// Key of a logical drive: this prefix, then its source and target start in 512-byte units
+/// (48 bits each), so it is found at either place.
+const LOGICAL_KEY_PREFIX: &[u8; 4] = b"MBRL";
+const KEY_UNIT: u64 = 512;
 
 /// Start of a journaled [`PartitionEntry`], so a snapshot in another format is never written
 /// into a table. The tag is followed by a u16 record count, then from byte 16 the records:
 /// a u16 layout index and the raw `PARTITION_INFORMATION_EX` as Windows reported it.
 const SNAPSHOT_TAG: &[u8; 8] = b"W32PIEX2";
+/// The same format for one logical drive: its own entry, then the entry that links to its EBR
+/// (the extended partition itself for the first logical drive).
+const LOGICAL_TAG: &[u8; 8] = b"W32LOGI1";
 const SNAPSHOT_RECORDS: usize = 16;
 const RECORD: usize = 2 + ENTRY;
 const MAX_RECORDS: usize = (ENTRY_SIZE - SNAPSHOT_RECORDS) / RECORD;
+
+/// Partition table sectors: the entries start here, the boot signature at 510.
+const TABLE_ENTRIES: usize = 446;
+const MBR_SIGNATURE: usize = 440;
+/// Most partition tables a chain is followed through.
+const MAX_TABLES: usize = 256;
 
 /// MBR types of an extended partition (CHS, LBA, Linux).
 pub fn is_extended_type(kind: u8) -> bool {
@@ -34,7 +62,7 @@ pub struct SnapshotRecord {
 fn records(snapshot: &PartitionEntry) -> Result<Vec<(usize, &[u8])>, IoError> {
     let s = &snapshot.0;
     let count = usize::from(u16::from_le_bytes([s[8], s[9]]));
-    if &s[..8] != SNAPSHOT_TAG || count == 0 || count > MAX_RECORDS {
+    if !(&s[..8] == SNAPSHOT_TAG || &s[..8] == LOGICAL_TAG) || count == 0 || count > MAX_RECORDS {
         return Err(INVALID);
     }
     Ok((0..count)
@@ -174,7 +202,7 @@ impl Layout {
     }
 
     /// Stable identity for the core: the GPT partition GUID, or the MBR primary slot index.
-    /// `None` for MBR logical partitions, which this version does not move.
+    /// `None` for MBR logical drives: their key depends on the move ([`Self::logical_key`]).
     pub fn key_of(&self, entry: &LayoutEntry) -> Option<PartitionKey> {
         match self.style {
             LayoutStyle::Gpt => entry.gpt_id.map(PartitionKey),
@@ -188,7 +216,38 @@ impl Layout {
         }
     }
 
+    /// Key for moving the logical drive that starts at `source` to `target`: it names the
+    /// drive at either place. `None` if a start isn't a multiple of 512 or is too large.
+    pub fn logical_key(source: u64, target: u64) -> Option<PartitionKey> {
+        let unit = |v: u64| (v % KEY_UNIT == 0 && v / KEY_UNIT < 1 << 48).then_some(v / KEY_UNIT);
+        let (s, t) = (unit(source)?, unit(target)?);
+        let mut key = [0u8; 16];
+        key[..4].copy_from_slice(LOGICAL_KEY_PREFIX);
+        key[4..10].copy_from_slice(&s.to_le_bytes()[..6]);
+        key[10..16].copy_from_slice(&t.to_le_bytes()[..6]);
+        Some(PartitionKey(key))
+    }
+
+    /// Source and target start of a logical-drive key.
+    fn logical_ends(key: PartitionKey) -> Option<(u64, u64)> {
+        if key.0[..4] != *LOGICAL_KEY_PREFIX {
+            return None;
+        }
+        let at = |i: usize| {
+            let mut a = [0u8; 8];
+            a[..6].copy_from_slice(&key.0[i..i + 6]);
+            u64::from_le_bytes(a) * KEY_UNIT
+        };
+        Some((at(4), at(10)))
+    }
+
     pub fn find(&self, key: PartitionKey) -> Option<LayoutEntry> {
+        if let Some((source, target)) = Self::logical_ends(key) {
+            return self
+                .entries()
+                .into_iter()
+                .find(|e| self.is_logical(e) && (e.offset == source || e.offset == target));
+        }
         self.entries()
             .into_iter()
             .find(|e| self.key_of(e) == Some(key))
@@ -200,6 +259,93 @@ impl Layout {
         self.entries()
             .iter()
             .all(|e| e.offset.saturating_add(e.length) <= start || end <= e.offset)
+    }
+
+    /// [`Self::range_is_free`] as a place for the partition `key` names. For a logical drive the
+    /// range must lie inside the extended partition, which itself doesn't count; the other
+    /// logical drives, their EBRs (the link entries cover them) and the EBR at the start of the
+    /// extended partition do.
+    pub fn range_is_free_for(&self, key: PartitionKey, start: u64, length: u64) -> bool {
+        if Self::logical_ends(key).is_none() {
+            return self.range_is_free(start, length);
+        }
+        self.free_in_container(start, length)
+    }
+
+    fn free_in_container(&self, start: u64, length: u64) -> bool {
+        let Some(container) = self.container() else {
+            return false;
+        };
+        let end = start.saturating_add(length);
+        start > container.offset
+            && end <= container.offset + container.length
+            && self
+                .entries()
+                .iter()
+                .filter(|e| e.index >= 4)
+                .all(|e| e.offset.saturating_add(e.length) <= start || end <= e.offset)
+    }
+
+    /// An MBR logical drive (not a link in the EBR chain).
+    pub fn is_logical(&self, entry: &LayoutEntry) -> bool {
+        self.style == LayoutStyle::Mbr
+            && entry.index >= 4
+            && entry
+                .mbr_type
+                .is_some_and(|t| t != 0 && !is_extended_type(t))
+    }
+
+    /// The extended partition, from the MBR's own slots.
+    fn container(&self) -> Option<LayoutEntry> {
+        self.entries().into_iter().find(|e| self.is_container(e))
+    }
+
+    fn kind_at(&self, index: usize) -> u8 {
+        self.raw[self.entry_base(index) + MBR_TYPE]
+    }
+
+    /// Slots of group `group` that exist in the array.
+    fn slots(&self, group: usize) -> std::ops::Range<usize> {
+        (group * 4).min(self.count)..(group * 4 + 4).min(self.count)
+    }
+
+    /// The link entry of a group: where the next EBR is.
+    fn link_in(&self, group: usize) -> Option<usize> {
+        self.slots(group).find(|&i| {
+            let b = self.entry_base(i);
+            is_extended_type(self.kind_at(i)) && u64_at(&self.raw, b + LENGTH) != 0
+        })
+    }
+
+    /// The logical drive of a group.
+    fn logical_in(&self, group: usize) -> Option<usize> {
+        self.slots(group).find(|&i| {
+            let kind = self.kind_at(i);
+            kind != 0 && !is_extended_type(kind)
+        })
+    }
+
+    /// Byte position of the table holding group `group` (the MBR for group 0).
+    fn table_of(&self, group: usize) -> Option<u64> {
+        match group {
+            0 => Some(0),
+            1 => self.container().map(|c| c.offset),
+            _ => self
+                .link_in(group - 1)
+                .map(|i| u64_at(&self.raw, self.entry_base(i) + START)),
+        }
+    }
+
+    fn put(&mut self, index: usize, entry: &[u8]) {
+        let b = self.entry_base(index);
+        self.raw[b..b + ENTRY].copy_from_slice(entry);
+    }
+
+    fn set_start_and_hidden(&mut self, index: usize, start: u64, relative_sectors: u64) {
+        let b = self.entry_base(index);
+        self.raw[b + START..b + START + 8].copy_from_slice(&start.to_le_bytes());
+        self.raw[b + MBR_HIDDEN..b + MBR_HIDDEN + 4]
+            .copy_from_slice(&(relative_sectors as u32).to_le_bytes());
     }
 
     /// MBR disk signature.
@@ -229,6 +375,9 @@ impl Layout {
 
     /// The entries exactly as Windows reported them, for [`Self::insert`].
     pub fn snapshot(&self, entry: &LayoutEntry) -> Result<PartitionEntry, IoError> {
+        if self.is_logical(entry) {
+            return self.logical_snapshot(entry);
+        }
         let members = self.members(entry);
         if members.len() > MAX_RECORDS {
             return Err(IoError::Os(8)); // ERROR_NOT_ENOUGH_MEMORY: too many logical drives
@@ -245,10 +394,291 @@ impl Layout {
         Ok(PartitionEntry(out))
     }
 
+    /// A logical drive's own entry, then the one that links to its EBR: the extended partition
+    /// for the first logical drive (its EBR is at the container start), else the previous
+    /// group's link.
+    fn logical_snapshot(&self, entry: &LayoutEntry) -> Result<PartitionEntry, IoError> {
+        let group = entry.index / 4;
+        let incoming = if group == 1 {
+            self.container().map(|c| c.index)
+        } else {
+            self.link_in(group - 1)
+        }
+        .ok_or(INVALID)?;
+        let mut out = [0u8; ENTRY_SIZE];
+        out[..8].copy_from_slice(LOGICAL_TAG);
+        out[8..10].copy_from_slice(&2u16.to_le_bytes());
+        for (i, index) in [entry.index, incoming].into_iter().enumerate() {
+            let b = SNAPSHOT_RECORDS + i * RECORD;
+            let e = self.entry_base(index);
+            out[b..b + 2].copy_from_slice(&(index as u16).to_le_bytes());
+            out[b + 2..b + RECORD].copy_from_slice(&self.raw[e..e + ENTRY]);
+        }
+        Ok(PartitionEntry(out))
+    }
+
+    /// Take one logical drive out of the chain, changing a single EBR. The first logical
+    /// drive's slot is emptied in place: its EBR, at the start of the extended partition, has
+    /// to stay. A later one is unlinked: the previous group's link takes over its own link and
+    /// its group leaves the array.
+    fn remove_logical(&mut self, entry: &LayoutEntry) {
+        let group = entry.index / 4;
+        if group == 1 {
+            let b = self.entry_base(entry.index);
+            self.raw[b..b + ENTRY].fill(0);
+            return;
+        }
+        let next = self.link_in(group).map(|i| {
+            let b = self.entry_base(i);
+            self.raw[b..b + ENTRY].to_vec()
+        });
+        if let Some(prev) = self.link_in(group - 1) {
+            match next {
+                Some(link) => self.put(prev, &link),
+                None => {
+                    let b = self.entry_base(prev);
+                    self.raw[b..b + ENTRY].fill(0);
+                }
+            }
+        }
+        let b = self.entry_base(group * 4);
+        let end = self.entry_base(self.slots(group).end);
+        self.raw.drain(b..end);
+        self.set_count(self.count - (end - b) / ENTRY);
+    }
+
+    /// Put a logical drive taken out by [`Self::remove_logical`] back, starting at `start`.
+    /// The first logical drive goes back into its slot; a later one gets its EBR back at the
+    /// same distance before its data, linked in after the group with the nearest earlier EBR.
+    fn insert_logical(
+        &mut self,
+        key: PartitionKey,
+        snapshot: &PartitionEntry,
+        start: u64,
+        sector_size: u32,
+    ) -> Result<(), IoError> {
+        let records = records(snapshot)?;
+        let (source, target) = Self::logical_ends(key).ok_or(INVALID)?;
+        if snapshot.0[..8] != *LOGICAL_TAG || records.len() != 2 || self.style != LayoutStyle::Mbr {
+            return Err(INVALID);
+        }
+        let ((slot, logical), (incoming_index, incoming)) = (records[0], records[1]);
+        let container = self.container().ok_or(INVALID)?;
+        let sector = u64::from(sector_size);
+        let (old_start, length) = (u64_at(logical, START), u64_at(logical, LENGTH));
+        if old_start != source || !(start == source || start == target) {
+            return Err(INVALID); // the snapshot or place doesn't belong to this key
+        }
+        if start % sector != 0 || slot < 4 {
+            return Err(INVALID);
+        }
+        if self
+            .entries()
+            .iter()
+            .any(|e| self.is_logical(e) && (e.offset == source || e.offset == target))
+        {
+            return Err(IoError::Os(183)); // ERROR_ALREADY_EXISTS: it is in the table already
+        }
+        if incoming_index < 4 {
+            // The first logical drive: the EBR at the start of the extended partition stayed.
+            if incoming_index != container.index
+                || u64_at(incoming, START) != container.offset
+                || slot / 4 != 1
+                || self.count < 8
+            {
+                return Err(INVALID);
+            }
+            if !self.free_in_container(start, length)
+                || self.logical_in(1).is_some()
+                || self.kind_at(slot) != 0
+            {
+                return Err(IoError::Os(183));
+            }
+            self.put(slot, logical);
+            self.set_start_and_hidden(slot, start, (start - container.offset) / sector);
+            return Ok(());
+        }
+        let gap = old_start
+            .checked_sub(u64_at(incoming, START))
+            .filter(|&g| g >= sector && g % sector == 0)
+            .ok_or(INVALID)?;
+        let ebr = start.checked_sub(gap).ok_or(INVALID)?;
+        // Its EBR and the data after it, with nothing in between, so the chain stays in disk
+        // order.
+        if !self.free_in_container(ebr, start + length - ebr) {
+            return Err(IoError::Os(183));
+        }
+        let groups = self.count / 4;
+        let prev = (1..groups)
+            .filter(|&g| self.table_of(g).is_some_and(|t| t < ebr))
+            .max()
+            .ok_or(INVALID)?;
+        let prev_link = match self.link_in(prev) {
+            Some(i) => i,
+            None => self
+                .slots(prev)
+                .find(|&i| self.kind_at(i) == 0)
+                .ok_or(INVALID)?,
+        };
+        let next_link = self.link_in(prev).map(|i| {
+            let b = self.entry_base(i);
+            self.raw[b..b + ENTRY].to_vec()
+        });
+        // A new group of four after `prev`: the logical drive in its old slot, then the link
+        // to what came after `prev`.
+        let at = (prev + 1) * 4;
+        let b = self.entry_base(at);
+        self.raw.splice(b..b, std::iter::repeat_n(0u8, 4 * ENTRY));
+        self.set_count(self.count + 4);
+        let own = at + slot % 4;
+        self.put(own, logical);
+        self.set_start_and_hidden(own, start, gap / sector);
+        if let Some(link) = next_link {
+            self.put(at + (slot + 1) % 4, &link);
+        }
+        self.put(prev_link, incoming);
+        self.set_start_and_hidden(prev_link, ebr, (ebr - container.offset) / sector);
+        Ok(())
+    }
+
+    /// The EBR of the logical drive starting at `start`, as it must be on disk, if that drive
+    /// has an EBR of its own (every logical drive but the first). Written before the table
+    /// update that links to it.
+    pub fn logical_ebr(&self, start: u64, sector_size: u32) -> Option<(u64, Vec<u8>)> {
+        let entry = self
+            .entries()
+            .into_iter()
+            .find(|e| self.is_logical(e) && e.offset == start)?;
+        let group = entry.index / 4;
+        if group < 2 {
+            return None;
+        }
+        Some((
+            self.table_of(group)?,
+            self.table_sector(group, sector_size)?,
+        ))
+    }
+
+    /// Partition table `group` as Windows writes it: the MBR (group 0) or an EBR.
+    fn table_sector(&self, group: usize, sector_size: u32) -> Option<Vec<u8>> {
+        let sector = u64::from(sector_size);
+        let mut out = vec![0u8; sector_size as usize];
+        let here = self.table_of(group)?;
+        let container = self.container().map_or(0, |c| c.offset);
+        for (k, index) in self.slots(group).enumerate() {
+            let b = self.entry_base(index);
+            let e = &self.raw[b..b + ENTRY];
+            let kind = e[MBR_TYPE];
+            if kind == 0 || u64_at(e, LENGTH) == 0 {
+                continue;
+            }
+            let base = match group {
+                0 => 0,
+                _ if is_extended_type(kind) => container,
+                _ => here,
+            };
+            let rel = u64_at(e, START).checked_sub(base)? / sector;
+            let t = TABLE_ENTRIES + 16 * k;
+            out[t] = e[MBR_BOOT];
+            out[t + 1..t + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+            out[t + 4] = kind;
+            out[t + 5..t + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+            out[t + 8..t + 12].copy_from_slice(&u32::try_from(rel).ok()?.to_le_bytes());
+            out[t + 12..t + 16].copy_from_slice(
+                &u32::try_from(u64_at(e, LENGTH) / sector)
+                    .ok()?
+                    .to_le_bytes(),
+            );
+        }
+        if group == 0 {
+            out[MBR_SIGNATURE..MBR_SIGNATURE + 4].copy_from_slice(&self.signature());
+        }
+        out[510] = 0x55;
+        out[511] = 0xAA;
+        Some(out)
+    }
+
+    /// Every MBR partition table sector, where it goes and what it holds, the way
+    /// `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` writes them (the simulator's model of Windows).
+    pub fn table_sectors(&self, sector_size: u32) -> Vec<(u64, Vec<u8>)> {
+        (0..self.count.div_ceil(4))
+            .filter_map(|g| Some((self.table_of(g)?, self.table_sector(g, sector_size)?)))
+            .collect()
+    }
+
+    /// Read an MBR and its EBR chain the way Windows does: four entries per table, following
+    /// each link to the next EBR, stopping at a table without a boot signature. The
+    /// simulator's model of `IOCTL_DISK_GET_DRIVE_LAYOUT_EX`.
+    pub fn read_mbr(
+        sector_size: u32,
+        mut read_sector: impl FnMut(u64) -> Result<Vec<u8>, IoError>,
+    ) -> Result<Self, IoError> {
+        let sector = u64::from(sector_size);
+        let mbr = read_sector(0)?;
+        if mbr.len() < 512 || mbr[510..512] != [0x55, 0xAA] {
+            return Err(INVALID);
+        }
+        let mut raw = vec![0u8; HEADER];
+        raw[8..12].copy_from_slice(&mbr[MBR_SIGNATURE..MBR_SIGNATURE + 4]);
+        let mut container: Option<u64> = None;
+        let mut table = (0u64, mbr);
+        let mut number = 0u32;
+        for group in 0..MAX_TABLES {
+            let (here, data) = &table;
+            let mut next = None;
+            for k in 0..4 {
+                let t = TABLE_ENTRIES + 16 * k;
+                let kind = data[t + 4];
+                let rel = u64::from(u32_at(data, t + 8));
+                let sectors = u64::from(u32_at(data, t + 12));
+                let mut e = [0u8; ENTRY];
+                if kind != 0 && sectors != 0 {
+                    let base = match (group, container) {
+                        (0, _) => 0,
+                        (_, Some(c)) if is_extended_type(kind) => c,
+                        _ => *here,
+                    };
+                    let start = base + rel * sector;
+                    e[START..START + 8].copy_from_slice(&start.to_le_bytes());
+                    e[LENGTH..LENGTH + 8].copy_from_slice(&(sectors * sector).to_le_bytes());
+                    e[MBR_TYPE] = kind;
+                    e[MBR_BOOT] = data[t];
+                    e[MBR_HIDDEN..MBR_HIDDEN + 4].copy_from_slice(&(rel as u32).to_le_bytes());
+                    if is_extended_type(kind) {
+                        if group == 0 {
+                            container = Some(start);
+                        }
+                        next = next.or(Some(start));
+                    } else {
+                        number += 1;
+                        e[NUMBER..NUMBER + 4].copy_from_slice(&number.to_le_bytes());
+                        e[MBR_RECOGNIZED] = 1;
+                    }
+                }
+                raw.extend_from_slice(&e);
+            }
+            let Some(at) = next.filter(|&n| n > *here) else {
+                break;
+            };
+            let data = read_sector(at)?;
+            if data.len() < 512 || data[510..512] != [0x55, 0xAA] {
+                break; // not a partition table: the chain ends here
+            }
+            table = (at, data);
+        }
+        let count = (raw.len() - HEADER) / ENTRY;
+        raw[4..8].copy_from_slice(&(count as u32).to_le_bytes());
+        Self::parse(raw)
+    }
+
     /// Drop an entry. GPT entries leave the array; an MBR primary slot is emptied in place so
     /// the other slots keep their positions, and an extended partition takes its logical
-    /// drives with it.
+    /// drives with it. A logical drive leaves on its own ([`Self::remove_logical`]).
     pub fn remove(&mut self, entry: &LayoutEntry) {
+        if self.is_logical(entry) {
+            self.remove_logical(entry);
+            return;
+        }
         let b = self.entry_base(entry.index);
         match self.style {
             LayoutStyle::Mbr => {
@@ -279,7 +709,13 @@ impl Layout {
         offset: u64,
         sector_size: u32,
     ) -> Result<(), IoError> {
+        if Self::logical_ends(key).is_some() {
+            return self.insert_logical(key, snapshot, offset, sector_size);
+        }
         let records = records(snapshot)?;
+        if snapshot.0[..8] != *SNAPSHOT_TAG {
+            return Err(INVALID);
+        }
         let (_, first) = records[0];
         if records
             .iter()
@@ -363,6 +799,28 @@ impl Layout {
         }
         out
     }
+}
+
+/// [`Layout::insert`], and for a logical drive with an EBR of its own, write that EBR to the
+/// disk now, durably, before the caller writes the layout. Windows' rewrite of the chain can be
+/// torn by a crash; with the EBR already in place, a link that lands before it still points at
+/// a valid table, so no logical drive after it drops out of the chain.
+pub fn insert_and_write_ebr<D: BlockDevice>(
+    disk: &mut D,
+    layout: &mut Layout,
+    key: PartitionKey,
+    snapshot: &PartitionEntry,
+    start: u64,
+) -> Result<(), IoError> {
+    let sector_size = disk.sector_size();
+    layout.insert(key, snapshot, start, sector_size)?;
+    if Layout::logical_ends(key).is_some() {
+        if let Some((at, sector)) = layout.logical_ebr(start, sector_size) {
+            disk.write_at(at, &sector)?;
+            disk.flush()?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -611,6 +1069,324 @@ mod tests {
         assert_eq!(
             layout.insert(key, &snapshot, 512 << 20, 512),
             Err(IoError::Os(183))
+        );
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// Primary at 1 MiB; extended partition 64..576 MiB holding three logical drives laid out
+    /// the way Windows creates them (EBR, then the drive 1 MiB later except for the first):
+    /// L1 72..96 MiB (EBR at 64), L2 129..161 MiB (EBR at 128), L3 257..320 MiB (EBR at 256).
+    fn three_logicals() -> Layout {
+        let mut raw = vec![0u8; HEADER + 16 * ENTRY];
+        raw[4..8].copy_from_slice(&16u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut put = |i: usize, offset: u64, length: u64, kind: u8, hidden: u64| {
+            let b = HEADER + i * ENTRY;
+            raw[b + 8..b + 16].copy_from_slice(&offset.to_le_bytes());
+            raw[b + 16..b + 24].copy_from_slice(&length.to_le_bytes());
+            raw[b + 32] = kind;
+            raw[b + 36..b + 40].copy_from_slice(&((hidden / 512) as u32).to_le_bytes());
+        };
+        put(0, MIB, 32 * MIB, 0x07, MIB);
+        put(1, 64 * MIB, 512 * MIB, 0x05, 64 * MIB);
+        put(4, 72 * MIB, 24 * MIB, 0x07, 8 * MIB);
+        put(5, 128 * MIB, 33 * MIB, 0x05, 64 * MIB);
+        put(8, 129 * MIB, 32 * MIB, 0x07, MIB);
+        put(9, 256 * MIB, 64 * MIB, 0x05, 192 * MIB);
+        put(12, 257 * MIB, 63 * MIB, 0x07, MIB);
+        Layout::parse(raw).unwrap()
+    }
+
+    type Shape = Vec<(u64, u64, Option<u8>, u32)>;
+
+    /// Start, length, type and hidden sectors of every entry, in order.
+    fn shape(layout: &Layout) -> Shape {
+        layout
+            .entries()
+            .iter()
+            .map(|e| {
+                let hidden = u32_at(&layout.raw, layout.entry_base(e.index) + MBR_HIDDEN);
+                (e.offset, e.length, e.mbr_type, hidden)
+            })
+            .collect()
+    }
+
+    fn logicals(layout: &Layout) -> Vec<(u64, u64)> {
+        let mut all: Vec<(u64, u64)> = layout
+            .entries()
+            .iter()
+            .filter(|e| layout.is_logical(e))
+            .map(|e| (e.offset, e.length))
+            .collect();
+        all.sort_unstable();
+        all
+    }
+
+    /// The layout as Windows would read it back after writing it to disk.
+    fn reread(layout: &Layout) -> Layout {
+        let sectors: std::collections::HashMap<u64, Vec<u8>> =
+            layout.table_sectors(512).into_iter().collect();
+        Layout::read_mbr(512, |at| {
+            Ok(sectors.get(&at).cloned().unwrap_or_else(|| vec![0; 512]))
+        })
+        .unwrap()
+    }
+
+    /// Table sectors that differ between two layouts (added, removed or changed).
+    fn changed_tables(a: &Layout, b: &Layout) -> Vec<u64> {
+        let a: std::collections::BTreeMap<u64, Vec<u8>> =
+            a.table_sectors(512).into_iter().collect();
+        let b: std::collections::BTreeMap<u64, Vec<u8>> =
+            b.table_sectors(512).into_iter().collect();
+        let mut at: Vec<u64> = a.keys().chain(b.keys()).copied().collect();
+        at.sort_unstable();
+        at.dedup();
+        at.retain(|k| a.get(k) != b.get(k));
+        at
+    }
+
+    /// Move a logical drive in the layout the way the mover does: out, then back at `to`.
+    /// Returns the layout while it was out, and after.
+    fn move_logical(layout: &Layout, from: u64, to: u64) -> Result<(Layout, Layout), IoError> {
+        let key = Layout::logical_key(from, to).unwrap();
+        let entry = layout.find(key).unwrap();
+        let snapshot = layout.snapshot(&entry)?;
+        let mut out = layout.clone();
+        out.remove(&entry);
+        assert!(out.find(key).is_none());
+        assert_eq!(
+            shape(&reread(&out)),
+            shape(&out),
+            "chain readable while out"
+        );
+        assert!(out.range_is_free_for(key, from, entry.length));
+        let mut back = out.clone();
+        back.insert(key, &snapshot, to, 512)?;
+        Ok((out, back))
+    }
+
+    fn check_moved(before: &Layout, after: &Layout, from: u64, to: u64) {
+        let mut want: Vec<(u64, u64)> = logicals(before)
+            .into_iter()
+            .map(|(o, l)| (if o == from { to } else { o }, l))
+            .collect();
+        want.sort_unstable();
+        assert_eq!(logicals(after), want, "{from} -> {to}");
+        assert_eq!(shape(&reread(after)), shape(after), "chain on disk matches");
+        let key = Layout::logical_key(from, to).unwrap();
+        assert_eq!(after.find(key).map(|e| e.offset), Some(to));
+        let primary = |l: &Layout| {
+            l.entries()
+                .into_iter()
+                .filter(|e| e.index < 4)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(primary(before), primary(after), "MBR untouched");
+    }
+
+    #[test]
+    fn first_logical_moves_left_and_right_in_its_slot() {
+        let layout = three_logicals();
+        for to in [65 * MIB, 104 * MIB] {
+            let (out, after) = move_logical(&layout, 72 * MIB, to).unwrap();
+            check_moved(&layout, &after, 72 * MIB, to);
+            assert_eq!(
+                changed_tables(&layout, &out),
+                vec![64 * MIB],
+                "only the EBR at the container start changes"
+            );
+            assert_eq!(changed_tables(&layout, &after), vec![64 * MIB]);
+            let moved = after
+                .entries()
+                .into_iter()
+                .find(|e| e.offset == to)
+                .unwrap();
+            assert_eq!(moved.index, 4, "same slot");
+            assert_eq!(after.logical_ebr(to, 512), None, "its EBR never moves");
+        }
+    }
+
+    #[test]
+    fn middle_logical_moves_with_its_ebr() {
+        let layout = three_logicals();
+        for to in [200 * MIB, 110 * MIB] {
+            let (out, after) = move_logical(&layout, 129 * MIB, to).unwrap();
+            check_moved(&layout, &after, 129 * MIB, to);
+            assert_eq!(
+                changed_tables(&layout, &out),
+                vec![64 * MIB, 128 * MIB],
+                "unlinked: the previous EBR now skips it, and its own EBR is no longer read"
+            );
+            let ebr = to - MIB;
+            assert_eq!(
+                changed_tables(&out, &after),
+                vec![64 * MIB, ebr],
+                "linked back: the previous EBR and its new one"
+            );
+            let (at, sector) = after.logical_ebr(to, 512).unwrap();
+            let written: std::collections::HashMap<u64, Vec<u8>> =
+                after.table_sectors(512).into_iter().collect();
+            assert_eq!((at, Some(&sector)), (ebr, written.get(&ebr)));
+        }
+    }
+
+    #[test]
+    fn last_logical_moves_left_and_right() {
+        let layout = three_logicals();
+        for to in [400 * MIB, 200 * MIB, 162 * MIB] {
+            let (out, after) = move_logical(&layout, 257 * MIB, to).unwrap();
+            check_moved(&layout, &after, 257 * MIB, to);
+            assert_eq!(changed_tables(&layout, &out), vec![128 * MIB, 256 * MIB]);
+            let mut expected = vec![128 * MIB, to - MIB];
+            expected.sort_unstable();
+            assert_eq!(changed_tables(&out, &after), expected);
+            let last = after.entries().into_iter().max_by_key(|e| e.index).unwrap();
+            assert_eq!(last.offset, to, "still the last in the chain");
+        }
+    }
+
+    #[test]
+    fn rollback_puts_the_chain_back_exactly() {
+        let layout = three_logicals();
+        for from in [72 * MIB, 129 * MIB, 257 * MIB] {
+            let key = Layout::logical_key(from, 400 * MIB).unwrap();
+            let entry = layout.find(key).unwrap();
+            let snapshot = layout.snapshot(&entry).unwrap();
+            let mut l = layout.clone();
+            l.remove(&entry);
+            l.insert(key, &snapshot, from, 512).unwrap();
+            assert_eq!(shape(&l), shape(&layout), "from {from}");
+            assert!(changed_tables(&layout, &l).is_empty());
+        }
+    }
+
+    #[test]
+    fn logical_drive_only_moves_into_free_room_inside_its_container() {
+        let layout = three_logicals();
+        for (from, to, why) in [
+            (129 * MIB, 230 * MIB, "runs into the next EBR"),
+            (72 * MIB, 64 * MIB, "over the EBR at the container start"),
+            (
+                72 * MIB,
+                120 * MIB,
+                "the first logical runs into the next EBR",
+            ),
+            (257 * MIB, 150 * MIB, "its EBR would land inside L2"),
+            (
+                257 * MIB,
+                161 * MIB,
+                "its EBR would be the last sector of L2",
+            ),
+            (
+                257 * MIB,
+                520 * MIB,
+                "past the end of the extended partition",
+            ),
+            (129 * MIB, 32 * MIB, "outside the extended partition"),
+        ] {
+            assert!(
+                move_logical(&layout, from, to).is_err(),
+                "{from} -> {to}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_insert_changes_nothing() {
+        let layout = three_logicals();
+        let key = Layout::logical_key(129 * MIB, 230 * MIB).unwrap();
+        let entry = layout.find(key).unwrap();
+        let snapshot = layout.snapshot(&entry).unwrap();
+        let mut out = layout.clone();
+        out.remove(&entry);
+        let before = out.raw.clone();
+        assert_eq!(
+            out.insert(key, &snapshot, 230 * MIB, 512),
+            Err(IoError::Os(183))
+        );
+        assert_eq!(out.raw, before);
+        assert_eq!(
+            out.insert(key, &snapshot, 300 * MIB, 512),
+            Err(INVALID),
+            "neither the key's source nor its target"
+        );
+    }
+
+    #[test]
+    fn logical_key_names_both_places() {
+        let layout = three_logicals();
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        assert_eq!(Layout::logical_ends(key), Some((129 * MIB, 200 * MIB)));
+        let l2 = layout.find(key).unwrap();
+        assert_eq!(l2.offset, 129 * MIB);
+        assert_eq!(layout.key_of(&l2), None, "logical drives have no fixed key");
+        assert!(Layout::logical_key(513, 0).is_none());
+        assert!(Layout::logical_key(0, 512 << 48).is_none());
+        let records = snapshot_records(&layout.snapshot(&l2).unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            (records[0].offset, records[0].mbr_type),
+            (129 * MIB, Some(0x07))
+        );
+        assert_eq!(
+            (records[1].offset, records[1].mbr_type),
+            (128 * MIB, Some(0x05))
+        );
+    }
+
+    #[test]
+    fn snapshots_only_go_back_with_their_own_kind_of_key() {
+        let layout = three_logicals();
+        let extended = layout.entries().into_iter().find(|e| e.index == 1).unwrap();
+        let whole = layout.snapshot(&extended).unwrap();
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        let l2 = layout.find(key).unwrap();
+        let single = layout.snapshot(&l2).unwrap();
+        let mut out = layout.clone();
+        out.remove(&l2);
+        assert_eq!(out.insert(key, &whole, 200 * MIB, 512), Err(INVALID));
+        let container_key = layout.key_of(&extended).unwrap();
+        let mut gone = layout.clone();
+        gone.remove(&extended);
+        assert_eq!(
+            gone.insert(container_key, &single, 64 * MIB, 512),
+            Err(INVALID)
+        );
+    }
+
+    #[test]
+    fn free_check_for_a_logical_drive_ignores_only_its_container() {
+        let layout = three_logicals();
+        let primary = layout.key_of(&layout.entries()[0]).unwrap();
+        assert!(
+            !layout.range_is_free_for(primary, 200 * MIB, MIB),
+            "inside the container"
+        );
+        let key = Layout::logical_key(129 * MIB, 200 * MIB).unwrap();
+        assert!(layout.range_is_free_for(key, 200 * MIB, MIB));
+        assert!(
+            !layout.range_is_free_for(key, 64 * MIB, MIB),
+            "the first EBR"
+        );
+        assert!(!layout.range_is_free_for(key, 128 * MIB, 512), "an EBR");
+        assert!(!layout.range_is_free_for(key, 600 * MIB, MIB), "outside");
+    }
+
+    #[test]
+    fn chain_ends_at_a_table_without_a_boot_signature() {
+        let layout = three_logicals();
+        let mut sectors: std::collections::HashMap<u64, Vec<u8>> =
+            layout.table_sectors(512).into_iter().collect();
+        sectors.get_mut(&(256 * MIB)).unwrap()[511] = 0;
+        let read = Layout::read_mbr(512, |at| {
+            Ok(sectors.get(&at).cloned().unwrap_or_else(|| vec![0; 512]))
+        })
+        .unwrap();
+        assert_eq!(
+            logicals(&read),
+            vec![(72 * MIB, 24 * MIB), (129 * MIB, 32 * MIB)],
+            "L3 drops out, as on Windows"
         );
     }
 }

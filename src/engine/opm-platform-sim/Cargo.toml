@@ -13,3 +13,7 @@ sha2 = "0.11"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The logical-drive campaign runs the real EBR chain code against simulated sectors.
+opm-platform-win32 = { path = "../opm-platform-win32" }

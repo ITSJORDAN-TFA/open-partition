@@ -126,6 +126,10 @@ public class LayoutParserTests
 
         Assert.Equal([1, 2, 3, 0, 4, 5], layout.Partitions.Select(p => p.Number));
         Assert.Single(layout.Partitions, p => MbrTypes.IsExtended(p.MbrType!.Value));
+        // Each logical drive's EBR: the first at the container start, the next where the link points.
+        Assert.Equal(
+            [null, null, null, null, 2001 * Units.MiB, 3001 * Units.MiB],
+            layout.Partitions.Select(p => p.EbrOffset));
     }
 
     [Fact]

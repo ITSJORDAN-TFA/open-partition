@@ -334,6 +334,158 @@ function Test-DriveLettersSurviveMbrMoves {
     Invoke-ExtendedPartitionScenario -DriveLetters
 }
 
+function Get-DiskpartPartitions {
+    # diskpart's own view of the table: '<number> <type> <offset KB>' per partition.
+    param([int] $DiskNumber)
+    $script = Join-Path $env:OPM_HARNESS_OUT "diskpart-$DiskNumber-$([guid]::NewGuid().ToString('N').Substring(0, 8)).txt"
+    try {
+        Set-Content -Path $script -Value "select disk $DiskNumber", 'list partition' -Encoding ascii
+        $lines = @(diskpart /s $script)
+        foreach ($line in $lines) {
+            if ($line -match '^\s*\*?\s*Partition\s+(\d+)\s+(\S+)\s+\d+\s+\S+\s+(\d+)\s+(KB|MB|GB)') {
+                $unit = @{ KB = 1KB; MB = 1MB; GB = 1GB }[$Matches[4]]
+                [pscustomobject] @{ Number = [int]$Matches[1]; Type = $Matches[2]; Offset = [long]$Matches[3] * $unit }
+            }
+        }
+    }
+    finally { Remove-Item $script -ErrorAction SilentlyContinue }
+}
+
+function Assert-DiskpartAgrees {
+    # diskpart must list the same partitions, of the same kinds, at the same places as the
+    # storage module. Its offsets are rounded, so compare to the nearest MiB.
+    param([int] $DiskNumber)
+    $mine = @(Get-Partition -DiskNumber $DiskNumber | Sort-Object Offset)
+    $theirs = @(Get-DiskpartPartitions -DiskNumber $DiskNumber | Sort-Object Offset)
+    if ($theirs.Count -ne $mine.Count) { throw "diskpart lists $($theirs.Count) partitions, Get-Partition $($mine.Count)." }
+    for ($i = 0; $i -lt $mine.Count; $i++) {
+        if ([Math]::Round($theirs[$i].Offset / 1MB) -ne [Math]::Round($mine[$i].Offset / 1MB)) {
+            throw "diskpart has partition $($theirs[$i].Number) at $($theirs[$i].Offset), Get-Partition at $($mine[$i].Offset)."
+        }
+    }
+    $logical = @($theirs | Where-Object Type -eq 'Logical').Count
+    if ($logical -ne 3) { throw "diskpart lists $logical logical drives, not 3." }
+}
+
+function Invoke-LogicalDriveScenario {
+    <#
+        Move single logical drives inside their extended partition (issue #14). Grow the
+        extended partition into the free space after it, then move the last, middle and first
+        logical drive right and back left again, one at a time. After every move: diskpart and
+        Get-Partition agree, every volume keeps its GUID (and with -DriveLetters its letter).
+        At the end every file is byte-identical and every scan is clean. With -KillAfterSeconds
+        the middle drive's first move is killed part way and recovered.
+    #>
+    param([double] $KillAfterSeconds = 0, [switch] $DriveLetters)
+    $layout = 'mbr-512n-logical-boxed-in'
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $path = Join-Path $env:OPM_HARNESS_OUT "engine-logical-$id.vhdx"
+    $journal = Join-Path $env:OPM_HARNESS_OUT "engine-logical-$id.journal"
+    try {
+        $manifest = New-TestDisk -Layout $layout -Path $path -Seed 17
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        $disk = $vhd.DiskNumber
+        $letters = @{}
+        foreach ($label in @(if ($DriveLetters) { 'LOG1', 'LOG3' })) {
+            $letter = Get-FreeDriveLetter
+            (Find-PartitionByLabel -DiskNumber $disk -Label $label).Partition | Set-Partition -NewDriveLetter $letter
+            $letters[$label] = $letter
+        }
+        $labels = @($manifest.Data | ForEach-Object Label)
+        $paths = @{}
+        foreach ($label in $labels) { $paths[$label] = (Find-PartitionByLabel -DiskNumber $disk -Label $label).Volume.Path }
+
+        # Room inside the extended partition: grow it to the end of the disk (1 MiB aligned).
+        $extended = Get-Partition -DiskNumber $disk | Where-Object Type -eq 'Extended'
+        $end = [Math]::Floor((Get-Disk -Number $disk).Size / 1MB) * 1MB
+        $grow = Invoke-Engine @('grow-extended', '--disk', $disk, '--offset', $extended.Offset, '--length', ($end - $extended.Offset))
+        if ($grow.ExitCode -ne 0) { throw "Growing the extended partition failed: $($grow.Output -join ' | ')" }
+        Assert-DiskpartAgrees -DiskNumber $disk
+
+        $moves = @(
+            @{ Label = 'LOG3'; By = 128MB }   # last, right
+            @{ Label = 'LOG2'; By = 64MB }    # middle, right
+            @{ Label = 'LOG1'; By = 32MB }    # first, right
+            @{ Label = 'LOG1'; By = -32MB }   # first, left
+            @{ Label = 'LOG2'; By = -64MB }   # middle, left
+            @{ Label = 'LOG3'; By = -64MB }   # last, left
+        )
+        $killed = $false
+        foreach ($m in $moves) {
+            $p = (Find-PartitionByLabel -DiskNumber $disk -Label $m.Label).Partition
+            $to = $p.Offset + $m.By
+            $arguments = @('move', '--disk', $disk, '--from', $p.Offset, '--to', $to, '--journal', $journal)
+            if ($KillAfterSeconds -gt 0 -and $m.Label -eq 'LOG2' -and -not $killed) {
+                $killed = $true
+                $log = "$journal.log"
+                $process = Start-Process -FilePath (Get-EnginePath) -ArgumentList ($arguments + @('--chunk', 8MB, '--delay-ms', 150, '--full-copy')) -PassThru -NoNewWindow -RedirectStandardOutput $log
+                while (-not $process.HasExited -and -not @(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -like 'progress stage=copying*' }).Count) { Start-Sleep -Milliseconds 100 }
+                Start-Sleep -Milliseconds ([int]($KillAfterSeconds * 1000))
+                if ($process.HasExited) { throw "Move finished before the kill: $(Get-Content $log -Raw)" }
+                Stop-Process -Id $process.Id -Force
+                $process.WaitForExit()
+                $now = @(Get-Partition -DiskNumber $disk | Where-Object { $_.Offset -in $p.Offset, $to })
+                if ($now.Count) { throw 'The logical drive was still in the table while its data was being moved.' }
+                foreach ($other in 'LOG1', 'LOG3') { $null = Find-PartitionByLabel -DiskNumber $disk -Label $other }
+                $result = Invoke-Engine @('recover', '--disk', $disk, '--journal', $journal)
+                if ($result.ExitCode -ne 0 -or -not ($result.Output -match '^result=done')) { throw "Recovery failed: $($result.Output -join ' | ')" }
+            }
+            else {
+                $result = Invoke-Engine $arguments
+                if ($result.ExitCode -ne 0) { throw "Moving $($m.Label) by $($m.By / 1MB) MiB failed: $($result.Output | Where-Object { $_ -notlike 'progress*' })" }
+            }
+            $now = Get-Partition -DiskNumber $disk | Where-Object { $_.Offset -eq $to -and $_.Size -eq $p.Size }
+            if (-not $now) { throw "$($m.Label) is not at $to after the move." }
+            Assert-DiskpartAgrees -DiskNumber $disk
+            foreach ($label in $labels) {
+                $found = Find-PartitionByLabel -DiskNumber $disk -Label $label
+                if ($found.Volume.Path -ne $paths[$label]) { throw "$label volume GUID changed after moving $($m.Label): $($found.Volume.Path) (was $($paths[$label]))." }
+            }
+            foreach ($label in $letters.Keys) {
+                $lp = (Find-PartitionByLabel -DiskNumber $disk -Label $label).Partition
+                if ([string]$lp.DriveLetter -ne $letters[$label]) { throw "$label lost drive letter $($letters[$label]) after moving $($m.Label): now '$($lp.DriveLetter)'." }
+            }
+        }
+
+        Dismount-VHD -Path $path
+        $vhd = Mount-VHD -Path $path -ReadOnly -NoDriveLetter -Passthru
+        foreach ($data in $manifest.Data) {
+            $found = Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label $data.Label
+            $problems = @(Test-DeterministicData -Root $found.Volume.Path -TargetBytes $data.Bytes -Seed $data.Seed)
+            if ($problems.Count) { throw "$($data.Label): $($problems -join '; ')" }
+        }
+        Dismount-VHD -Path $path
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        foreach ($label in $labels) {
+            $volume = (Find-PartitionByLabel -DiskNumber $vhd.DiskNumber -Label $label).Volume
+            $scan = Repair-Volume -Path $volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { throw "$label file system scan reported: $scan" }
+        }
+    }
+    finally {
+        Dismount-VHD -Path $path -ErrorAction SilentlyContinue
+        Remove-Item $path, "$path.manifest.json", $journal, "$journal.log" -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-MoveSingleLogicalDrives {
+    Assert-EngineHost
+    Invoke-LogicalDriveScenario
+}
+
+function Test-KilledLogicalDriveMoveRecovers {
+    Assert-EngineHost
+    Invoke-LogicalDriveScenario -KillAfterSeconds 1
+}
+
+function Test-DriveLettersSurviveLogicalDriveMoves {
+    Assert-EngineHost
+    if (Get-Process msrdc, mstsc -ErrorAction SilentlyContinue) {
+        Skip-Test 'a Remote Desktop client is running and holds new drive letters open; close it to run this test'
+    }
+    Invoke-LogicalDriveScenario -DriveLetters
+}
+
 function Test-FailedVerificationRollsBack {
     <#
         The Azure field case of 2026-10-31: an extended partition moved far right (source and
