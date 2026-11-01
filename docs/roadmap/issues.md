@@ -44,25 +44,6 @@ depends: none
 
 **Files:** `src/engine/opm-platform-win32/src/volume.rs`, `copy_map.rs`, `tools/package/Test-OpmOnThisMachine.ps1`.
 
-## azure-source-change-rca: Find what changed E: during the first Azure move (verification failure)
-milestone: v0.2 — data partition moves, hardened
-labels: type: spike, area: engine, P1, needs-azure, needs-maintainer
-depends: none
-
-**Goal:** know what wrote to a locked, dismounted logical drive (E:) during the 2026-10-31 Azure move, so it can be prevented or detected up front rather than after copying.
-
-**Background:** the 65 GB extended-partition move finished copying, but the final source-digest check failed, so the move was rolled back with `rollback`. Since then the source is hashed after the entry leaves the table, and each chunk is checked as it is copied. A recurrence now stops at the exact chunk with `SourceChanged { offset }` and undoes itself. Candidates:
-- Windows writing to the volumes as the partitions leave the table;
-- a filter or agent writing below the file system (backup, replication, AV);
-- an application using E: that holds no file handle.
-
-**Tasks:**
-- [ ] On the Azure VM (fresh snapshot first), repeat a move of the extended partition with the current build. If it stops with `SourceChanged`, map the offset to a file: offset → volume → cluster, then `fsutil volume querycluster`.
-- [ ] Record filter drivers (`fltmc`, `fltmc instances`) and services touching E:.
-- [ ] Write up the cause and the mitigation in `.spec/plan.md`. If the writer can be detected before a move starts, open a follow-up to refuse or warn in the classifier.
-
-**Acceptance:** cause identified (or ruled down to a short list with evidence) and documented; follow-up issues opened.
-
 ## volume-users-restart-manager: Show what holds a volume open and offer to stop services
 milestone: v0.2 — data partition moves, hardened
 labels: type: feature, area: operations, area: gui, P2
