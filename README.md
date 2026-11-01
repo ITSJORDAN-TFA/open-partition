@@ -127,12 +127,12 @@ the engine itself, not just the GUI.
 | Move a partition (journaled, survives a crash or kill) | ✅ `opm move` | ✅ |
 | Move an MBR extended partition with its logical drives | ✅ `opm move <disk> extended` | ✅ |
 | Extend a volume into free space after it | ✅ `opm extend` | ✅ |
-| Queue several operations, preview, then apply | one at a time | ✅ |
+| Queue several operations, preview, then apply | ✅ `opm plan`, `opm apply` | ✅ |
 | Resume an interrupted move | ✅ `opm resume` | 🟡 |
 | Undo an interrupted move (if it never overwrote its original location) | ✅ `opm undo` | 🟡 |
 | Stop and undo by itself if the data changes under a move | ✅ | ✅ |
 | Copy only the space NTFS uses (free clusters are skipped) | ✅ | ✅ |
-| Merge repeated moves or extends of the same partition in the plan | — | ✅ |
+| Merge repeated moves or extends of the same partition in the plan | ✅ | ✅ |
 | Shrink, create, delete, format | ❌ | ❌ |
 | Move the Windows partition (boot-time mode) | ❌ | ❌ |
 
@@ -180,6 +180,83 @@ opm undo --yes      # or put it back where it was (when the move never overwrote
 ```
 
 Run from an elevated prompt; without elevation BitLocker status is unknown and moves would be refused.
+
+### Plans: several steps, previewed and applied together
+
+The GUI's planned-changes queue, from the command line (Server Core included):
+
+```powershell
+opm plan new free-c.json
+opm plan add free-c.json move 0 extended --to end
+opm plan add free-c.json move 0 I: --to end
+opm plan add free-c.json extend 0 C:            # --size max (the default) or a byte count
+opm plan show free-c.json                        # dry run: the steps, each disk now and after
+opm apply free-c.json --snapshot my-snap --yes [--json]
+```
+
+- Each `plan add` is checked against the disk as the earlier steps leave it (so `C:` can grow
+  only once the moves before it have made room), and is merged like the GUI does: two moves
+  of the same partition in a row become one move, a move back to where it started cancels
+  out, and two extends become one. `@<offset>` means the partition's offset at that point in
+  the plan.
+- `opm apply` checks every step again against the live disks before anything is written. It
+  refuses, without changing anything, if a disk is missing or its partitions changed since the
+  plan was made (including by applying the plan once already). The write gate is the same as
+  for `opm move`: test VHD/VHDX disks always, real disks only on an Azure VM with `--snapshot`.
+  Without `--yes` it is a dry run.
+- Steps run in order and the run stops at the first failure: the steps before it are complete,
+  the rest are not started. Check with `opm show` (and `opm resume` if a move was interrupted),
+  then make a new plan for what is left.
+
+**Plan file format** (version 1). JSON, written by `opm plan`; edit it by hand only if you know
+what you are doing, because `opm apply` re-checks it but can only apply what is in it.
+
+```json
+{
+  "format": 1,
+  "createdBy": "Open Partition Manager 0.1.0",
+  "createdAt": "2026-10-31T12:00:00+00:00",
+  "machine": "SERVER01",
+  "disks": [
+    { "number": 0, "diskId": "<GPT disk GUID or MBR signature, as in the engine journal>",
+      "size": 274877906944, "fingerprint": "<SHA-256 of the partition layout>" }
+  ],
+  "steps": [
+    { "kind": "move", "disk": 0, "what": "the extended partition", "from": 64961380352, "to": 204509413376, "length": 69805899776 },
+    { "kind": "extend", "disk": 0, "what": "C:", "offset": 525336576, "oldSize": 53687091200, "newSize": 64424509440, "container": false }
+  ]
+}
+```
+
+- `format` is the file format version; a version of `opm` refuses formats it doesn't know.
+- `disks` records each disk as it was when its first step was added: the ID the engine
+  journals use, the size in bytes, and a fingerprint of its layout (style, size, sector size,
+  usable area, and each partition's offset, size, type and GUID; not volume contents). Disks
+  are found again by ID and size, so a disk renumbered after a reboot is still found.
+- `steps` run in order. All values are bytes. `move`: the partition starting at `from` (of
+  `length` bytes) moves to start at `to`. `extend`: the partition at `offset` grows from
+  `oldSize` to `newSize`; `container: true` grows an MBR extended partition itself.
+
+**`--json` progress.** `opm apply --json` writes one JSON object per line to standard output
+and nothing else:
+
+| `event` | Fields | When |
+|---|---|---|
+| `step` | `index`, `total`, `disk`, `description` | once per step, before anything runs |
+| `gate` | `disk`, `verdict` (`Allowed`, `NeedsSnapshot`, `Refused`), `message` | once per disk |
+| `dry-run` | `message` | no `--yes`: nothing was changed (last line) |
+| `progress` | `index`, `total`, `fraction` (0 to 1, or `null`), `text` | while a step runs |
+| `result` | `succeeded`, `completed`, `total`, `failedStep` (1-based, or `null`), `error` | after the run (last line) |
+| `error` | `message` | refused before anything was written (last line) |
+
+The exit code is 0 when the plan was applied (or the dry run passed) and 1 otherwise.
+
+```json
+{"event":"step","index":1,"total":3,"disk":2,"description":"Move the extended partition on disk 2 right by 447 MB (to 703 MB)"}
+{"event":"gate","disk":2,"verdict":"Allowed","message":"Disk 2 is a test virtual disk."}
+{"event":"progress","index":1,"total":3,"fraction":0.42,"text":"Copying"}
+{"event":"result","succeeded":true,"completed":3,"total":3,"failedStep":null,"error":null}
+```
 
 To try the engine safely on any machine, run `Test-OpmOnThisMachine.ps1` from the preview
 package. It builds throwaway VHDX disks, moves partitions on them, and deletes them afterwards.
