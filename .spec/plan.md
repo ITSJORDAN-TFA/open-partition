@@ -300,3 +300,18 @@ Shipped since the "Operations in the GUI and CLI" section above:
   - Drag-to-place Move/Extend dialogs with exact MiB fields and a whole-disk strip.
 - **Releases:** CI publishes `openpartition-<version>-win-x64.zip` to GitHub Releases (tags
   `v*`), and a rolling `preview` pre-release from `main`.
+
+### Shadow-copy remediation (#13)
+
+Discovery retains Win32_ShadowStorage source/storage GUID relationships. CLI `opm shadows`
+and the GUI offer volume-naming confirmation before permanent client-accessible snapshot
+removal. Automatic remediation currently requires every affected disk to be file-backed;
+real-disk/backup-provider management remains an administrator task. Refresh runs after each
+attempt. Remaining associations continue to block moving; deletion is not claimed to remove
+them on every Windows/provider version. Snapshot-preserving relocation is unsupported.
+Microsoft documents that resizing can discard copies:
+https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/vssadmin-resize-shadowstorage
+Deletion scope/context:
+https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/vssadmin-delete-shadows
+The VHDX acceptance scenario must run in a disposable guest with
+`OPM_DISPOSABLE_VSS_GUEST=1`; host VSS services/snapshots must not be changed for testing.

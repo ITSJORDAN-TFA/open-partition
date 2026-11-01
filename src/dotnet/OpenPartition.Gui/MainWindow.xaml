@@ -1,4 +1,4 @@
-﻿<Window x:Class="OpenPartition.Gui.MainWindow"
+<Window x:Class="OpenPartition.Gui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:OpenPartition.Gui"
@@ -263,6 +263,7 @@
                         <StackPanel Visibility="{Binding IsPartition, Converter={StaticResource Visible}}">
                             <Border Background="#F7F9FC" CornerRadius="8" Padding="6">
                                 <StackPanel>
+                                    <Button Style="{StaticResource FlatButton}" Click="OnShadowsClick" Content="Shadow copies..." />
                                     <Button Style="{StaticResource FlatButton}" IsEnabled="{Binding CanMove}" Click="OnMoveClick" AutomationProperties.Name="Move…">
                                         <StackPanel Orientation="Horizontal">
                                             <TextBlock Text="&#xE7C2;" Style="{StaticResource Glyph}" Foreground="{StaticResource AccentBrush}" Margin="0,0,12,0" />

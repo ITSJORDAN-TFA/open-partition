@@ -48,6 +48,8 @@ public sealed record FreeExtent(long Offset, long Size)
     public long End => Offset + Size;
 }
 
+public sealed record ShadowStorageInfo(string SourceVolume, string StorageVolume);
+
 public sealed record VolumeInfo
 {
     /// <summary>Volume GUID path, e.g. <c>\\?\Volume{...}\</c>.</summary>
@@ -63,6 +65,7 @@ public sealed record VolumeInfo
     public string? BitLockerDetail { get; init; }
     public bool HasPageFile { get; init; }
     public bool HasHibernationFile { get; init; }
+    public IReadOnlyList<ShadowStorageInfo> ShadowStorage { get; init; } = [];
     public bool HasShadowCopies { get; init; }
     /// <summary>This volume stores shadow copies for one or more volumes.</summary>
     public bool HostsShadowStorage { get; init; }

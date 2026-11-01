@@ -84,6 +84,8 @@ internal static class TextReport
         if (p.Volume is { } v)
         {
             o.WriteLine($"{pad}volume {v.Path}");
+            foreach (var a in v.ShadowStorage) o.WriteLine($"{pad}shadow source {a.SourceVolume}, storage {a.StorageVolume}");
+            if (v.HasShadowCopies || v.HostsShadowStorage) o.WriteLine($"{pad}Use opm shadows {disk.Number} @{p.Offset} for remediation guidance.");
             foreach (var mount in v.MountPoints) o.WriteLine($"{pad}mounted at {mount}");
             o.WriteLine($"{pad}BitLocker: {v.BitLocker}{(v.BitLockerDetail is null ? "" : $" ({v.BitLockerDetail})")}");
         }

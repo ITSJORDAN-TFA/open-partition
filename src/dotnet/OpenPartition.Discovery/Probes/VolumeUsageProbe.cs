@@ -44,8 +44,9 @@ internal static partial class VolumeUsageProbe
     public static HashSet<string> HibernationVolumes(IEnumerable<VolumeFacts> volumes) =>
         volumes.Where(v => File.Exists(v.Path + "hiberfil.sys")).Select(v => v.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-    public static (HashSet<string> WithShadowCopies, HashSet<string> HostingShadowStorage) ShadowCopies(List<string> notes)
+    public static (HashSet<string> WithShadowCopies, HashSet<string> HostingShadowStorage, List<ShadowStorageInfo> Associations) ShadowCopies(List<string> notes)
     {
+        var associations = new List<ShadowStorageInfo>();
         var copies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var storage = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var shadowCopies = Wmi.Query(Wmi.Cimv2, "SELECT VolumeName FROM Win32_ShadowCopy");
@@ -70,10 +71,13 @@ internal static partial class VolumeUsageProbe
             // References look like: Win32_Volume.DeviceID="\\\\?\\Volume{guid}\\"
             if (row.String("DiffVolume") is { } diff && VolumeGuidPattern().Match(diff) is { Success: true } m)
             {
-                storage.Add(VolumeProbe.Normalize($@"\\?\{m.Value}"));
+                var target = VolumeProbe.Normalize($@"\\?\{m.Value}");
+                storage.Add(target);
+                if (row.String("Volume") is { } source && VolumeGuidPattern().Match(source) is { Success: true } sm)
+                    associations.Add(new(VolumeProbe.Normalize($@"\\?\{sm.Value}"), target));
             }
         }
-        return (copies, storage);
+        return (copies, storage, associations);
     }
 
     public static Dictionary<string, BitLockerInfo> BitLocker(IEnumerable<VolumeFacts> volumes, bool elevated, List<string> notes)

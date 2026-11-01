@@ -333,6 +333,20 @@ internal static class Dialogs
         window.ShowDialog();
     }
 
+    public static string? ConfirmShadowDeletion(Window owner, OpenPartition.Model.VolumeInfo volume)
+    {
+        var panel = new StackPanel();
+        panel.Children.Add(Text(ShadowCopies.Explain(volume)));
+        panel.Children.Add(Text("To permanently delete this source volume's client-accessible copies, type its full path: " + volume.Path));
+        var input = new TextBox();
+        panel.Children.Add(input);
+        return Show(owner, "Shadow copies", panel, "Permanently delete", () =>
+        {
+            ShadowCopies.DeleteArguments(volume.Path, input.Text);
+            return input.Text;
+        });
+    }
+
     private static T? Show<T>(Window owner, string title, UIElement body, string okText, Func<T> create, double width = 560) where T : class
     {
         T? result = null;

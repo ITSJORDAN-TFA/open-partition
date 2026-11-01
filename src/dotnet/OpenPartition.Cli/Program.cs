@@ -5,7 +5,7 @@ using OpenPartition.Discovery;
 using OpenPartition.Model;
 using OpenPartition.Operations;
 
-string[] valued = ["--to", "--size", "--snapshot"];
+string[] valued = ["--to", "--size", "--snapshot", "--confirm-volume"];
 var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var positionalList = new List<string>();
 for (var i = 0; i < args.Length; i++)
@@ -40,6 +40,8 @@ try
             return await MoveAsync(moveDisk, positional[2]);
         case "extend" when positional.Length == 3 && int.TryParse(positional[1], out var extendDisk):
             return await ExtendAsync(extendDisk, positional[2]);
+        case "shadows" when positional.Length == 3 && int.TryParse(positional[1], out var shadowDisk):
+            return await ShadowsAsync(shadowDisk, positional[2]);
         case "resume":
             return await ResumeAsync(undo: false);
         case "undo":
@@ -117,6 +119,19 @@ async Task<(SystemSnapshot Snapshot, DiskInfo Disk, PartitionInfo Partition)> Se
         _ => throw new PlanException($"'{which}' is not a drive letter (E:), 'extended', or @offset."),
     };
     return (snapshot, disk, partition ?? throw new PlanException($"No partition '{which}' on disk {diskNumber}."));
+}
+
+async Task<int> ShadowsAsync(int diskNumber, string which)
+{
+    var (_, _, partition) = await SelectAsync(diskNumber, which);
+    var volume = partition.Volume ?? throw new PlanException("Select a volume, rather than an extended container.");
+    Console.WriteLine(ShadowCopies.Explain(volume));
+    if (options.ContainsKey("--move-to")) throw new PlanException(ShadowCopies.Guidance);
+    if (!options.ContainsKey("--delete")) return 0;
+    if (!yes) { Console.WriteLine("Nothing changed. Deletion requires --yes --confirm-volume <full volume GUID path>."); return 0; }
+    try { await ShadowCopies.DeleteAsync(volume.Path, options.GetValueOrDefault("--confirm-volume") ?? ""); }
+    finally { await ShowAsync(diskNumber); }
+    return 0;
 }
 
 async Task<int> MoveAsync(int diskNumber, string which)
@@ -255,6 +270,8 @@ static void Help(TextWriter output)
     output.WriteLine("                             Finish a move that was interrupted");
     output.WriteLine("  opm undo [--snapshot <name>] [--yes]");
     output.WriteLine("                             Put an interrupted move's partition back where it was");
+    output.WriteLine("  opm shadows <disk> <which> [--delete --yes --confirm-volume <GUID path>]");
+    output.WriteLine("                             Explain shadow refusal; permanently delete only after naming the source volume");
     output.WriteLine("  opm version");
     output.WriteLine();
     output.WriteLine("  <which> is a drive letter (E:), 'extended' (an MBR extended partition with its");

@@ -513,6 +513,7 @@ public sealed class MainViewModel : ObservableObject
         if (v is not null)
         {
             details.Add(new("Volume", v.Path));
+            foreach (var a in v.ShadowStorage) details.Add(new("Shadow storage", $"Source {a.SourceVolume} on {a.StorageVolume}"));
             if (v.DriveLetter is { } l) details.Add(new("Drive letter", $"{l}:"));
             foreach (var m in v.MountPoints) details.Add(new("Mounted at", m));
             details.Add(new("File system", v.FileSystem ?? "none / RAW"));

@@ -22,6 +22,15 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void OnShadowsClick(object sender, RoutedEventArgs e)
+    {
+        if (_model.Selected?.Partition?.Volume is not { } volume) return;
+        if (Dialogs.ConfirmShadowDeletion(this, volume) is not { } confirmation) return;
+        try { await OpenPartition.Operations.ShadowCopies.DeleteAsync(volume.Path, confirmation); }
+        catch (Exception error) { MessageBox.Show(this, error.Message, "Shadow copies"); }
+        finally { await _model.RefreshAsync(); }
+    }
+
     private void OnMoveClick(object sender, RoutedEventArgs e)
     {
         if (_model.Selected is { Disk: { } disk, Partition: { } partition, CanMove: true } && Dialogs.AskMove(this, disk, partition) is { } step)
