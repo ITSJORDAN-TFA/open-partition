@@ -574,3 +574,60 @@ function Test-OpmGrowsLastLogicalDrive {
         Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
     }
 }
+
+function Test-MoveRecoveryPartitionAfterC {
+    Assert-EngineHost
+    # The engine moves a Recovery partition like any other; type, GUID and data must survive.
+    Invoke-MoveScenario -Layout 'gpt-512e-recovery-after-c' -Label 'RECOVERY' -TargetMB 895
+}
+
+function Test-OpmMovesRecoveryThenExtendsOs {
+    <#
+        C: boxed in by recovery, through `opm`: move the Recovery partition to the end of the
+        disk, then extend OS into the space it left. The running Windows' WinRE is not on this
+        VHDX, so opm must not run the WinRE hook (it would print "reagentc"); the WinRE
+        re-registration itself is tested in a VM by tests/harness/Test-WinReAfterMove.ps1.
+    #>
+    Assert-EngineHost
+    $layout = 'gpt-512e-recovery-after-c'
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $path = Join-Path $env:OPM_HARNESS_OUT "opm-recovery-$id.vhdx"
+    try {
+        $manifest = New-TestDisk -Layout $layout -Path $path -Seed 29
+        $vhd = Mount-VHD -Path $path -NoDriveLetter -Passthru
+        $disk = $vhd.DiskNumber
+        $os = Find-PartitionByLabel -DiskNumber $disk -Label 'OS'
+        $recovery = Find-PartitionByLabel -DiskNumber $disk -Label 'RECOVERY'
+        if ($recovery.Partition.GptType -ne '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') { throw "Layout did not create a recovery partition: $($recovery.Partition.GptType)." }
+
+        $refused = Invoke-Opm @('extend', $disk, "@$($os.Partition.Offset)")
+        if ($refused.ExitCode -eq 0) { throw 'OS was allowed to extend while boxed in by recovery.' }
+
+        $r = Invoke-Opm @('move', $disk, "@$($recovery.Partition.Offset)", '--to', 'end', '--yes')
+        if ($r.ExitCode -ne 0) { throw "opm move recovery failed: $($r.Output -join ' | ')" }
+        if ($r.Output -match 'reagentc') { throw "The WinRE hook ran for a recovery partition the running Windows does not use: $($r.Output -join ' | ')" }
+
+        $show = (Invoke-Opm @('show', $disk, '--json')).Output -join "`n" | ConvertFrom-Json
+        $moved = $show.Partitions | Where-Object { [guid]$_.PartitionGuid -eq [guid]$recovery.Partition.Guid }
+        if ($moved.Offset -le $recovery.Partition.Offset) { throw "Recovery partition did not move right: $($moved.Offset)." }
+        if ([guid]$moved.GptType -ne [guid]'de94bba4-06d1-4d40-a16a-bfd50179d6ac') { throw "Recovery type lost: $($moved.GptType)." }
+        if ([uint64]$moved.GptAttributes -ne 0x8000000000000001) { throw ('Recovery attributes changed: 0x{0:X16}.' -f [uint64]$moved.GptAttributes) }
+
+        $r = Invoke-Opm @('extend', $disk, "@$($os.Partition.Offset)", '--yes')
+        if ($r.ExitCode -ne 0) { throw "opm extend OS failed: $($r.Output -join ' | ')" }
+        $osNow = (Find-PartitionByLabel -DiskNumber $disk -Label 'OS').Partition
+        if ($osNow.Offset + $osNow.Size -ne $moved.Offset) { throw "OS ends at $($osNow.Offset + $osNow.Size), recovery starts at $($moved.Offset)." }
+
+        foreach ($data in $manifest.Data) {
+            $found = Find-PartitionByLabel -DiskNumber $disk -Label $data.Label
+            $problems = @(Test-DeterministicData -Root $found.Volume.Path -TargetBytes $data.Bytes -Seed $data.Seed)
+            if ($problems.Count) { throw "$($data.Label): $($problems -join '; ')" }
+            $scan = Repair-Volume -Path $found.Volume.Path -Scan
+            if ("$scan" -ne 'NoErrorsFound') { throw "$($data.Label) file system scan reported: $scan" }
+        }
+    }
+    finally {
+        Dismount-VHD -Path $path -ErrorAction SilentlyContinue
+        Remove-Item $path, "$path.manifest.json" -ErrorAction SilentlyContinue
+    }
+}

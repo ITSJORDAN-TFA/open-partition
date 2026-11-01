@@ -71,6 +71,21 @@ public partial class ReadOnlyEnforcementTests
         Assert.Equal(new HashSet<string> { "QueryOnlyAccess", "NativeMethods.GenericRead" }, accesses);
     }
 
+    [Fact]
+    public void DiscoveryOnlyRunsReagentcInfo()
+    {
+        // Turning WinRE off and on belongs to OpenPartition.Operations (WinReHook), never discovery.
+        var probe = DiscoverySources().Single(f => Path.GetFileName(f) == "WinReProbe.cs");
+        var mutating = File.ReadLines(probe).Where(line => ReagentcMutation().IsMatch(line)).Select(line => line.Trim()).ToList();
+        Assert.True(mutating.Count == 0, "Discovery runs a reagentc command that changes WinRE:\n" + string.Join("\n", mutating));
+        Assert.Contains("private const string InfoArgument = \"/info\";", File.ReadAllText(probe), StringComparison.Ordinal);
+        var starters = DiscoverySources().Where(f => File.ReadAllText(f).Contains("Process.Start", StringComparison.Ordinal)).Select(Path.GetFileName).ToList();
+        Assert.Equal(["WinReProbe.cs"], starters);
+    }
+
+    [GeneratedRegex(@"""/(enable|disable|boottore|setreimage|setosimage|setbootshelllink)", RegexOptions.IgnoreCase)]
+    private static partial Regex ReagentcMutation();
+
     [GeneratedRegex(@"=>\s*Open\(path,\s*([\w.]+)\)")]
     private static partial Regex AccessArguments();
 

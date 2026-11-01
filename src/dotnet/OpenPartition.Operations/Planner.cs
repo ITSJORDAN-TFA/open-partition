@@ -9,11 +9,16 @@ public abstract record PlannedStep(int DiskNumber, string What)
     public abstract string Describe();
 }
 
-/// <summary>Move a partition (or an extended partition with its logical drives) to <paramref name="To"/>.</summary>
-public sealed record MoveStep(int DiskNumber, string What, long From, long To, long Length) : PlannedStep(DiskNumber, What)
+/// <summary>
+/// Move a partition (or an extended partition with its logical drives) to <paramref name="To"/>.
+/// <paramref name="WinRe"/>: the partition holds the running Windows' recovery environment, so
+/// WinRE is turned off before the move and re-registered after it (<see cref="WinReHook"/>).
+/// </summary>
+public sealed record MoveStep(int DiskNumber, string What, long From, long To, long Length, bool WinRe = false) : PlannedStep(DiskNumber, What)
 {
     public override string Describe() =>
-        $"Move {What} on disk {DiskNumber} {(To > From ? "right" : "left")} by {Units.FormatBytes(Math.Abs(To - From))} (to {Units.FormatBytes(To)})";
+        $"Move {What} on disk {DiskNumber} {(To > From ? "right" : "left")} by {Units.FormatBytes(Math.Abs(To - From))} (to {Units.FormatBytes(To)})"
+        + (WinRe ? ", then re-register the Windows Recovery Environment" : "");
 }
 
 /// <summary>
@@ -59,6 +64,10 @@ public static class Planner
                 reasons.AddRange(child.Issues
                     .Where(i => i.BlocksOperation(OperationKind.Move) && i.Code != "partition.logical")
                     .Select(i => $"{name}: {i.Message}"));
+                if (child.HostsWinRe && !child.Issues.Any(i => i.Code == "partition.winre"))
+                {
+                    reasons.Add($"{name} holds the Windows Recovery Environment. Moving WinRE inside an extended partition is not supported.");
+                }
             }
         }
         if (reasons.Count == 0 && Range(disk, p) is null)
@@ -118,7 +127,7 @@ public static class Planner
         {
             throw new PlanException($"{Name(p)} can start anywhere from {Units.FormatBytes(range.Min)} to {Units.FormatBytes(range.Max)} on a 1 MiB boundary, other than where it is now.");
         }
-        return new MoveStep(disk.Number, Name(p), p.Offset, to, p.Size);
+        return new MoveStep(disk.Number, Name(p), p.Offset, to, p.Size, WinRe: p.HostsWinRe);
     }
 
     public static ExtendStep Extend(DiskInfo disk, PartitionInfo p, long newSize)
@@ -200,6 +209,7 @@ public static class Planner
     public static string Name(PartitionInfo p) => p switch
     {
         { Role: PartitionRole.Extended } => "the extended partition",
+        { Role: PartitionRole.Recovery, Volume: null or { DriveLetter: null } } => $"the recovery partition at {Units.FormatBytes(p.Offset)}",
         { Volume.DriveLetter: { } letter } => $"{letter}:",
         { Volume.Label: { Length: > 0 } label } => $"'{label}'",
         _ => $"partition {p.Number} at {Units.FormatBytes(p.Offset)}",

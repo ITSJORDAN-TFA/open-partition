@@ -236,6 +236,15 @@ async Task<int> ResumeAsync(bool undo)
             await Engine.RecoverAsync(move, disk.Number, name, progress);
             Console.WriteLine("Finished.");
         }
+        try
+        {
+            await WinReHook.Default.FinishAfterRecoveryAsync(move, disk.Number, undo, progress);
+        }
+        catch (OperationFailedException e)
+        {
+            Console.Error.WriteLine($"error: {e.Message}");
+            return 1;
+        }
     }
     return 0;
 }

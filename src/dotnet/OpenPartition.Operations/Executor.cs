@@ -21,8 +21,10 @@ public static class Executor
         string? snapshotName,
         IProgress<(int Index, StepProgress Progress)>? progress,
         Func<bool>? stopRequested = null,
+        WinReHook? winRe = null,
         CancellationToken cancellationToken = default)
     {
+        winRe ??= WinReHook.Default;
         for (var i = 0; i < steps.Count; i++)
         {
             // Only between steps: a move is never interrupted on purpose.
@@ -45,6 +47,20 @@ public static class Executor
                 var name = verdict == WriteVerdict.NeedsSnapshot ? snapshotName : null;
                 switch (step)
                 {
+                    case MoveStep { WinRe: true } move:
+                        // Post-move hook: the partition holds WinRE, which must be re-registered.
+                        await winRe.TurnOffAsync(move, stepProgress, cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            await Engine.MoveAsync(move, name, stepProgress, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (Exception e) when (IsOperationError(e))
+                        {
+                            var note = await winRe.AfterFailedMoveAsync(move, cancellationToken).ConfigureAwait(false);
+                            throw new OperationFailedException($"{e.Message} {note}");
+                        }
+                        await winRe.TurnOnAsync(move, stepProgress, cancellationToken).ConfigureAwait(false);
+                        break;
                     case MoveStep move:
                         await Engine.MoveAsync(move, name, stepProgress, cancellationToken).ConfigureAwait(false);
                         break;
@@ -58,11 +74,14 @@ public static class Executor
                         throw new OperationFailedException($"Unknown step {step.GetType().Name}.");
                 }
             }
-            catch (Exception e) when (e is OperationFailedException or System.Management.ManagementException or IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+            catch (Exception e) when (IsOperationError(e))
             {
                 return new RunResult(i, steps.Count, step, VolumeUsers.Explain(e.Message, snapshot));
             }
         }
         return new RunResult(steps.Count, steps.Count, null, null);
     }
+
+    private static bool IsOperationError(Exception e) =>
+        e is OperationFailedException or System.Management.ManagementException or IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception;
 }

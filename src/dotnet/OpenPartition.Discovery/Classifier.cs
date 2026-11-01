@@ -57,7 +57,10 @@ public static class Classifier
         return issues;
     }
 
-    public static IReadOnlyList<Issue> ForPartition(PartitionInfo p)
+    /// <param name="p">The partition.</param>
+    /// <param name="winRe">The running Windows' recovery environment; null when it was not read.</param>
+    /// <param name="diskNumber">The disk <paramref name="p"/> is on, to match reagentc's locations.</param>
+    public static IReadOnlyList<Issue> ForPartition(PartitionInfo p, WinReInfo? winRe = null, int? diskNumber = null)
     {
         var issues = new List<Issue>();
         var v = p.Volume;
@@ -74,7 +77,8 @@ public static class Classifier
                 break;
             case PartitionRole.Recovery:
                 issues.Add(new("partition.recovery", IssueSeverity.Blocker,
-                    "Windows Recovery partition. Changing it is not supported in this version; partitions around it can still be changed.", OperationKind.All));
+                    "Windows Recovery partition. It can be moved; other changes are not supported in this version.", OperationKind.All & ~OperationKind.Move));
+                issues.AddRange(ForRecoveryMove(p, winRe, diskNumber));
                 break;
             case PartitionRole.Extended:
                 issues.Add(new("partition.extended", IssueSeverity.Blocker,
@@ -93,7 +97,9 @@ public static class Classifier
                 break;
         }
 
-        if ((p.GptAttributes & GptAttributes.PlatformRequired) != 0)
+        // Windows sets "required" on its recovery partition so Disk Management won't delete it.
+        // A move keeps the entry's attributes, and every other change is blocked above.
+        if ((p.GptAttributes & GptAttributes.PlatformRequired) != 0 && p.Role != PartitionRole.Recovery)
         {
             issues.Add(new("partition.platform-required", IssueSeverity.Blocker,
                 "Marked as required by the platform (GPT attribute). It is never changed.", OperationKind.All));
@@ -107,6 +113,11 @@ public static class Classifier
         {
             issues.Add(new("partition.system", IssueSeverity.Blocker,
                 "System partition: holds the boot manager. Moving it needs the boot-time runner (not available yet).", DestructiveOrMoving));
+        }
+        if (p.HostsWinRe && p.Role != PartitionRole.Recovery)
+        {
+            issues.Add(new("partition.winre", IssueSeverity.Blocker,
+                "Holds the Windows Recovery Environment (WinRE). Moving it is only supported when WinRE is on a Recovery partition.", OperationKind.Move | OperationKind.Delete | OperationKind.Format));
         }
         if (p.IsBoot)
         {
@@ -174,6 +185,42 @@ public static class Classifier
                 "Azure temporary storage: wiped on redeploy, resize or host maintenance."));
         }
         return issues;
+    }
+
+    /// <summary>
+    /// A Recovery partition may move only if WinRE can be re-registered afterwards: its state
+    /// must be known, and the partition must not hold anything reagentc can't re-register.
+    /// </summary>
+    private static IEnumerable<Issue> ForRecoveryMove(PartitionInfo p, WinReInfo? winRe, int? diskNumber)
+    {
+        if (winRe is null || winRe.Status == WinReStatus.Unknown)
+        {
+            yield return new("partition.recovery-winre-unknown", IssueSeverity.Blocker,
+                $"The state of the Windows Recovery Environment could not be read{(winRe?.Error is { } e ? $" ({e})" : "")}, so it could not be re-registered after a move. "
+                + "Run 'reagentc /info' as Administrator to see why, then refresh.", OperationKind.Move);
+            yield break;
+        }
+        if (p.IsLogical)
+        {
+            // Covered by the logical-drive blocker; the extended partition holding it says why.
+            yield break;
+        }
+        if (winRe.ResetImage is { } reset && reset.DiskNumber == diskNumber && reset.PartitionNumber == p.Number)
+        {
+            yield return new("partition.recovery-reset-image", IssueSeverity.Blocker,
+                "Holds the system reset image registered with reagentc ('Recovery image location'). Re-registering it after a move is not supported, so it stays where it is.", OperationKind.Move);
+            yield break;
+        }
+        if (p.HostsWinRe)
+        {
+            yield return new("partition.recovery-winre", IssueSeverity.Info,
+                "Holds the Windows Recovery Environment (WinRE). A move turns WinRE off first (reagentc /disable keeps its image on C:), moves the partition, turns it back on and checks it is enabled on the moved partition.");
+        }
+        else
+        {
+            yield return new("partition.recovery-unused", IssueSeverity.Info,
+                $"WinRE is not on this partition (it is {winRe.Describe()}), so moving it does not affect WinRE.");
+        }
     }
 
     public static IReadOnlyList<Issue> ForMachine(HostEnvironment environment, bool elevated)
