@@ -369,7 +369,10 @@ function Test-FailedVerificationRollsBack {
 
         # Damage one sector of the copied part, in unpartitioned space.
         $bad = $target + $extended.Size - 8MB
-        $stream = [IO.FileStream]::new("\.\PhysicalDrive$disk", 'Open', 'ReadWrite', 'ReadWrite')
+        # Raw write: only to the test VHDX mounted above, never to whatever disk now has its number.
+        $raw = Get-Disk -Number $disk
+        if ($raw.BusType -ne 'File Backed Virtual' -or $raw.Location -ne $path) { throw "Disk $disk is not the test VHDX $path; refusing the raw write." }
+        $stream = [IO.FileStream]::new("\\.\PhysicalDrive$disk", 'Open', 'ReadWrite', 'ReadWrite')
         try {
             $stream.Position = $bad
             $junk = [byte[]]::new(512); [Array]::Fill($junk, [byte]0xEE)
