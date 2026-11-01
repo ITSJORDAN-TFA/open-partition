@@ -193,11 +193,39 @@ internal static class Dialogs
 
         var window = Frame(owner, "Apply planned changes", body, out var ok, out var cancel);
         ok.Content = "Apply";
-        void Refresh() => ok.IsEnabled = refused.Count == 0 && (!needsSnapshot || (confirm.IsChecked == true && snapshotName.Text.Trim().Length > 0));
+        var measuring = true;
+        void Refresh() => ok.IsEnabled = !measuring && refused.Count == 0 && (!needsSnapshot || (confirm.IsChecked == true && snapshotName.Text.Trim().Length > 0));
         confirm.Checked += (_, _) => Refresh();
         confirm.Unchecked += (_, _) => Refresh();
         snapshotName.TextChanged += (_, _) => Refresh();
         Refresh();
+
+        body.Children.Add(Text("Estimates include fingerprinting and verified copying. Azure disk tiers and VM sizes both cap throughput; caching, other workloads and NTFS free-space skipping can change the actual time.", muted: true));
+        window.Loaded += async (_, _) =>
+        {
+            for (var i = 0; i < steps.Count; i++)
+            {
+                var estimate = "Windows resize: duration depends on the file system";
+                if (steps[i] is MoveStep move)
+                {
+                    stepTexts[i].Text += " — measuring read speed…";
+                    try
+                    {
+                        var rate = await Engine.BenchAsync(move.DiskNumber, move.From, move.Length);
+                        estimate = rate is { } speed
+                            ? Throughput.FormatDuration(Throughput.EstimateMove(Throughput.BytesToCopy(snapshot, move), speed))
+                            : "estimate unavailable (read benchmark failed)";
+                    }
+                    catch (Exception e) when (e is System.ComponentModel.Win32Exception or System.IO.IOException or OperationFailedException)
+                    {
+                        estimate = "estimate unavailable (read benchmark could not run)";
+                    }
+                }
+                stepTexts[i].Text = $"{i + 1}. {steps[i].Describe()} — {estimate}";
+            }
+            measuring = false;
+            Refresh();
+        };
 
         var running = false;
         var stop = false;
