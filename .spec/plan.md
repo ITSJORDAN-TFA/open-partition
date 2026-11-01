@@ -98,6 +98,37 @@ SYS by moving the extended partition and PRIM, extend SYS), including an engine 
 resume`; the GUI driven by UI Automation through the same flow
 (`tests/harness/Test-GuiFreeAndExtend.ps1`). Next: first real-disk run on the Azure VM.
 
+### Who holds a volume open (2026-11-01, #9)
+
+When the engine can't lock a volume, `VolumeUsers.Diagnose` names the holders and
+`VolumeUsers.Format` (pure, xUnit-tested) words the message. Detection is read-only:
+`NtQuerySystemInformation(SystemExtendedHandleInformation)` lists every handle; file handles
+are duplicated into our process, filtered to disk files with `GetFileType` (pipes can block a
+name query forever), then `GetFinalPathNameByHandle(VOLUME_NAME_NT)` is matched against the
+volume's NT device name (`QueryDosDevice("Volume{…}")`), so volumes without a drive letter work
+too. Every query runs under a 1 s per-handle watchdog (a stuck worker thread is abandoned) and a
+20 s overall budget. Restart Manager is then asked about the files found, for friendly names.
+Services come from `Win32_Service.ProcessId`; running dependents via `Win32_DependentService`.
+Quirks worth knowing:
+- Restart Manager alone can't answer "what uses this volume": it needs the file names first.
+- Without elevation (or for protected processes) `OpenProcess(PROCESS_DUP_HANDLE)` fails.
+  SeDebugPrivilege is enabled for the scan only. Protected processes (csrss, lsass, Defender,
+  System, some svchost instances; checked with `GetProcessInformation(ProcessProtectionLevelInfo)`)
+  are not counted as gaps; any other process that can't be opened is named as unchecked and the
+  message points to Resource Monitor / handle.exe.
+- The watchdog is needed in practice: on the dev machine `GetFinalPathNameByHandle` blocks on
+  one disk-file handle of `RadeonSoftware.exe` (`GetFileType` returns FILE_TYPE_DISK, then the
+  name query waits on a synchronous file with I/O pending). That process is named as "some open
+  files could not be checked".
+- Process 4 (System) holds page files, SMB-shared files and driver files; it is named as
+  "Windows itself" with advice instead of a stop button.
+- Shared `svchost.exe` hosts (normal on Server 2016, which predates the per-service split) get
+  no stop button: we can't tell which of its services holds the file.
+The GUI offers "Stop service X and retry" only for services in their own process that accept
+stop; it asks first, stops dependents first, never stops processes, and doesn't restart the
+services afterwards (it tells the user to). Services are never stopped in tests; the harness
+test (`Test-LockFailureNamesTheProgramHoldingAFile`) only uses a child process it started.
+
 ---
 
 ## 1. Decisions to make now
@@ -300,3 +331,17 @@ Shipped since the "Operations in the GUI and CLI" section above:
   - Drag-to-place Move/Extend dialogs with exact MiB fields and a whole-disk strip.
 - **Releases:** CI publishes `openpartition-<version>-win-x64.zip` to GitHub Releases (tags
   `v*`), and a rolling `preview` pre-release from `main`.
+
+### Issue #9 continuation safety review (2026-11-01)
+
+Recovered the prior implementation and uncommitted formatting documentation into
+`feat/volume-users-restart-manager-sol`, preserving the original worktree. Formatting now
+receives elevation state in the diagnosis and does no system calls. Native handle-list
+bounds are checked before reading entries. Timed-out queries always mark detection partial;
+at most three scan workers can remain stuck across repeated diagnoses. Native path queries
+cannot be safely cancelled, so a stuck worker can retain its duplicated handle until exit.
+Service retry refuses newly discovered dependents outside the confirmed list, rather than
+silently expanding consent. Failure text acknowledges services already stopped before a failure.
+The VHDX holder test now exits cooperatively, without terminating a host process.
+Full host integration includes process termination for crash tests; it is not run when host
+process termination is prohibited. Run that suite in a disposable VM instead.
