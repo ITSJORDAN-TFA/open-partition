@@ -70,6 +70,20 @@ function Assert-MovedCorrectly {
     if ("$scan" -ne 'NoErrorsFound') { throw "File system scan reported: $scan" }
 }
 
+function Assert-FreeSpaceRead {
+    <#
+        An NTFS volume's free space must be read under the lock both from the on-disk $Bitmap
+        (raw parser) and from the file system, so the move only copies used clusters (plan gap
+        G11). Windows 11 answers both; Server 2016 only the raw read (see the self-test).
+    #>
+    param([string[]] $Output, $Before)
+    if ($Before.Volume.FileSystem -ne 'NTFS') { return }
+    $locked = @($Output | Where-Object { $_ -like 'locked=*' })
+    if (-not ($locked | Where-Object { $_ -match ' free_bytes=\d+ free_source=raw\+fsctl$' })) {
+        throw "Free space was not read both ways: $($locked -join ' | ')"
+    }
+}
+
 function Invoke-MoveScenario {
     param(
         [Parameter(Mandatory)] [string] $Layout,
@@ -109,6 +123,10 @@ function Invoke-MoveScenario {
             Stop-Process -Id $process.Id -Force
             $process.WaitForExit()
             $progress = @(Get-Content $log | Where-Object { $_ -like 'progress*' }).Count
+            # Killed after the lock: the interrupted move was a mapped one.
+            if (Get-Content $log | Where-Object { $_ -like 'locked=*' }) {
+                Assert-FreeSpaceRead -Output (Get-Content $log) -Before $before
+            }
 
             $recovery = Invoke-Engine @('recover', '--disk', $vhd.DiskNumber, '--journal', $journal)
             if ($recovery.ExitCode -ne 0) {
@@ -129,6 +147,7 @@ function Invoke-MoveScenario {
         else {
             $result = Invoke-Engine $arguments
             if ($result.ExitCode -ne 0) { throw "Move failed: $($result.Output | Where-Object { $_ -notlike 'progress*' })" }
+            Assert-FreeSpaceRead -Output $result.Output -Before $before
         }
 
         Assert-MovedCorrectly -Path $path -Manifest $manifest -Before $before -Target $target -Style $style
